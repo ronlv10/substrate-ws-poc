@@ -1,0 +1,13 @@
+{
+  "name": "ws-poc-echo-actor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stock Slack Bolt (Node) echo bot, run as a suspendable substrate actor",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@slack/bolt": "^3.22.0"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.3"
+  }
+}

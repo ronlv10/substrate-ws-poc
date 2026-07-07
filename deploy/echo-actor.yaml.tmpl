@@ -1,0 +1,116 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The echo actor: a normal Slack Socket Mode bot, run as a suspendable actor.
+# Apply with `ko apply -f` after substituting ${BUCKET_NAME}. It expects a
+# Secret named `slack-tokens` in this namespace holding the app-level and bot
+# tokens:
+#   kubectl -n ate-demo-ws-poc create secret generic slack-tokens \
+#       --from-literal=app-token=xapp-... --from-literal=bot-token=xoxb-...
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-ws-poc
+
+---
+
+# ate-api-server resolves the ActorTemplate's secretKeyRef env at golden-snapshot
+# / resume time, so it needs read access to the slack-tokens secret. Secret reads
+# are intentionally not granted cluster-wide (see manifests/ate-install/
+# ate-api-server.yaml); each tenant grants access to its own secret by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ate-api-server-slack-tokens
+  namespace: ate-demo-ws-poc
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["slack-tokens"]
+  verbs: ["get"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ate-api-server-slack-tokens
+  namespace: ate-demo-ws-poc
+subjects:
+- kind: ServiceAccount
+  name: ate-api-server
+  namespace: ate-system
+roleRef:
+  kind: Role
+  name: ate-api-server-slack-tokens
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: ws-poc-echo
+  namespace: ate-demo-ws-poc
+  labels:
+    workload: ws-poc-echo
+spec:
+  replicas: 2
+  ateomImage: ${ATEOM_IMAGE}
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: echo
+  namespace: ate-demo-ws-poc
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: echo
+    # The Bolt (Node) actor image, built + pinned by the Makefile (${ECHO_IMAGE}
+    # is substituted with the pushed digest). substrate ignores image ENV/CMD, so
+    # the command and env below are authoritative.
+    image: ${ECHO_IMAGE}
+    command: ["node", "/app/app.js"]
+    env:
+    - name: SLACK_APP_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: app-token
+    - name: SLACK_BOT_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: bot-token
+    - name: ATE_API_ADDR
+      value: "api.ate-system.svc.cluster.local:443"
+    # Make Node trust the broker CA that atelet mounts over the system bundle.
+    # Node ignores SSL_CERT_FILE; it honors NODE_EXTRA_CA_CERTS (adds to its roots).
+    - name: NODE_EXTRA_CA_CERTS
+      value: "/etc/ssl/certs/ca-certificates.crt"
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+  workerSelector:
+    matchLabels:
+      workload: ws-poc-echo
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Full
+    location: gs://${BUCKET_NAME}/ate-demo-ws-poc/

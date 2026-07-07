@@ -1,0 +1,121 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/wait"
+)
+
+// ActorRef identifies an actor. An actor name is only unique within its
+// atespace, so both fields are always carried together.
+type ActorRef struct {
+	Atespace string
+	Name     string
+}
+
+func (r ActorRef) String() string { return r.Atespace + "/" + r.Name }
+
+// Resumer ensures a (possibly suspended) actor is running. ResumeActor on the
+// substrate control plane blocks until the actor's readyz probe returns 200, so
+// a nil error means the actor is live and about to reconnect to the broker.
+type Resumer interface {
+	Resume(ctx context.Context, ref ActorRef) error
+}
+
+// Locator resolves the actor that owns a given worker-pod source IP. Actor
+// egress is SNAT'd behind the worker pod IP, so the broker sees that IP as the
+// connection's remote address and maps it back to an actor identity.
+type Locator interface {
+	LocateByPodIP(ctx context.Context, ip string) (ActorRef, error)
+}
+
+// controlClient adapts the substrate Control gRPC service to the Resumer and
+// Locator interfaces the broker depends on.
+type controlClient struct {
+	api    ateapipb.ControlClient
+	flight singleflight.Group
+
+	// bootOnResume makes Resume boot the actor fresh from its image instead of
+	// restoring the checkpoint. Needed for workloads gVisor cannot restore (a
+	// heavy interpreter like CPython trips "inconsistent private memory files
+	// on restore"); a light Go actor restores fine, so this is off by default.
+	bootOnResume bool
+}
+
+func newControlClient(api ateapipb.ControlClient, bootOnResume bool) *controlClient {
+	return &controlClient{api: api, bootOnResume: bootOnResume}
+}
+
+// Resume mirrors the router's resume path (cmd/atenet/internal/router/
+// resumer.go): deduplicate concurrent resumes of the same actor, detach from
+// the caller's context so one caller giving up does not abort the resume, and
+// retry only on Aborted (a concurrent-resume conflict).
+func (c *controlClient) Resume(ctx context.Context, ref ActorRef) error {
+	ch := c.flight.DoChan(ref.String(), func() (any, error) {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		backoff := wait.Backoff{Steps: 7, Duration: 200 * time.Millisecond, Factor: 1.5, Jitter: 0.2}
+		return nil, wait.ExponentialBackoffWithContext(bgCtx, backoff, func(ctx context.Context) (bool, error) {
+			_, err := c.api.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+				ActorRef: &ateapipb.ActorRef{Atespace: ref.Atespace, Name: ref.Name},
+				Boot:     c.bootOnResume,
+			})
+			if err == nil {
+				return true, nil
+			}
+			if status.Code(err) == codes.Aborted {
+				return false, nil // concurrent resume, retry
+			}
+			return false, err
+		})
+	})
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		return res.Err
+	}
+}
+
+// LocateByPodIP scans actors (optionally page by page) for a RUNNING actor
+// whose assigned worker pod IP matches ip.
+func (c *controlClient) LocateByPodIP(ctx context.Context, ip string) (ActorRef, error) {
+	var pageToken string
+	for {
+		resp, err := c.api.ListActors(ctx, &ateapipb.ListActorsRequest{PageSize: 1000, PageToken: pageToken})
+		if err != nil {
+			return ActorRef{}, fmt.Errorf("listing actors: %w", err)
+		}
+		for _, a := range resp.GetActors() {
+			if a.GetAteomPodIp() == ip && a.GetStatus() == ateapipb.Actor_STATUS_RUNNING {
+				return ActorRef{Atespace: a.GetAtespace(), Name: a.GetActorId()}, nil
+			}
+		}
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return ActorRef{}, fmt.Errorf("no running actor found at pod IP %q", ip)
+		}
+	}
+}

@@ -1,0 +1,103 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The WS-PoC egress broker: an always-on service that owns the persistent
+# Slack Socket Mode connection on behalf of suspendable actors. Apply with
+# `ko apply -f` so the ko:// image reference is built and pinned.
+#
+# Prerequisite: the broker CA secret must exist (see certs/gen-ca.sh):
+#   kubectl -n ws-poc create secret tls egress-broker-ca --cert=ca.crt --key=ca.key
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ws-poc
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: egress-broker
+  namespace: ws-poc
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-broker
+  namespace: ws-poc
+  labels:
+    app: egress-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: egress-broker
+  template:
+    metadata:
+      labels:
+        app: egress-broker
+    spec:
+      serviceAccountName: egress-broker
+      containers:
+      - name: broker
+        image: ko://github.com/ronlv10/substrate-ws-poc/cmd/egress-broker
+        args:
+        - --listen=:8443
+        - --wss-host=wss-primary.slack.com
+        - --wss-path=/ws-poc/socketmode
+        - --dns-upstream=8.8.8.8:53
+        - --ateapi-address=api.ate-system.svc:443
+        - --ateapi-auth=mtls
+        # Wake actors by booting fresh from the image on resume (kept from the
+        # CPython experiment; harmless for the Node actor, which also restores).
+        - --boot-on-resume=true
+        # Buffered events are delivered on the client's first heartbeat (its
+        # connected:ready signal) — no timer needed. --deliver-delay can arm a
+        # fallback for clients that never heartbeat, but Bolt always does.
+        - --ca-cert=/etc/ws-poc/ca/tls.crt
+        - --ca-key=/etc/ws-poc/ca/tls.key
+        ports:
+        - name: https
+          containerPort: 8443
+        volumeMounts:
+        - name: broker-ca
+          mountPath: /etc/ws-poc/ca
+          readOnly: true
+      volumes:
+      - name: broker-ca
+        secret:
+          secretName: egress-broker-ca
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-broker
+  namespace: ws-poc
+  labels:
+    app: egress-broker
+spec:
+  selector:
+    app: egress-broker
+  ports:
+  # Actors dial slack.com:443 (and wss over 443); cluster DNS points those
+  # hostnames here, and this Service forwards 443 to the broker's 8443 so the
+  # broker need not run privileged.
+  - name: https
+    port: 443
+    targetPort: 8443
