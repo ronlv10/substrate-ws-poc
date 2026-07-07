@@ -61,7 +61,6 @@ spec:
         - --wss-path=/ws-poc/socketmode
         - --dns-upstream=8.8.8.8:53
         - --ateapi-address=api.ate-system.svc:443
-        - --ateapi-auth=mtls
         # Wake actors by booting fresh from the image on resume (kept from the
         # CPython experiment; harmless for the Node actor, which also restores).
         - --boot-on-resume=true
