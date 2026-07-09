@@ -85,9 +85,13 @@ build:
 	ko build $(BROKER_PKG)
 	$(MAKE) build-actor-image
 
-# Build and push the Bolt (Node) actor image.
+# Build and push the actor image: the local proxy (cross-compiled here) as
+# PID 1 plus the ncc-bundled Bolt app, with the proxy TLS material baked in.
 .PHONY: build-actor-image
 build-actor-image:
+	bash $(CADIR)/gen-proxy-cert.sh
+	GOOS=linux GOARCH=$(ACTOR_ARCH) CGO_ENABLED=0 \
+		go build -o echo-actor/local-proxy ./cmd/local-proxy
 	docker build --platform linux/$(ACTOR_ARCH) -t $(ECHO_IMAGE):latest $(CURDIR)/echo-actor
 	docker push $(ECHO_IMAGE):latest
 
@@ -105,6 +109,10 @@ atelet-ca:
 coredns-patch:
 	@bash $(CURDIR)/deploy/coredns-patch.sh
 
+# BROKER_ADDRESS empty deploys the proxy standalone (phase-1 loop); set it to
+# egress-broker.ws-poc.svc.cluster.local:9090 for the full path.
+BROKER_ADDRESS ?=
+
 .PHONY: deploy-actor
 deploy-actor: build-actor-image
 	@test -n "$(BUCKET_NAME)" || { echo "set BUCKET_NAME=<snapshot bucket>"; exit 1; }
@@ -112,7 +120,8 @@ deploy-actor: build-actor-image
 	@ECHO_REF=$$(docker inspect --format='{{index .RepoDigests 0}}' $(ECHO_IMAGE):latest); \
 		echo "echo actor image: $$ECHO_REF"; \
 		sed -e "s|\$${BUCKET_NAME}|$(BUCKET_NAME)|g" -e "s|\$${ECHO_IMAGE}|$$ECHO_REF|g" \
-			-e "s|\$${ATEOM_IMAGE}|$(ATEOM_IMAGE)|g" deploy/echo-actor.yaml.tmpl | kubectl apply -f -
+			-e "s|\$${ATEOM_IMAGE}|$(ATEOM_IMAGE)|g" -e "s|\$${BROKER_ADDRESS}|$(BROKER_ADDRESS)|g" \
+			deploy/echo-actor.yaml.tmpl | kubectl apply -f -
 	kubectl -n ate-demo-ws-poc rollout status deployment/ws-poc-echo-deployment --timeout=300s || true
 	kubectl wait --for=condition=Ready actortemplate/echo -n ate-demo-ws-poc --timeout=300s
 
