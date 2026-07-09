@@ -54,6 +54,11 @@ help:
 test:
 	go test ./...
 
+# Regenerate the broker↔proxy gRPC stubs (generated code is committed).
+.PHONY: gen-proto
+gen-proto:
+	go run github.com/bufbuild/buf/cmd/buf@v1.50.0 generate
+
 .PHONY: gen-ca
 gen-ca:
 	cd $(CADIR) && OUT_DIR=. bash gen-ca.sh
