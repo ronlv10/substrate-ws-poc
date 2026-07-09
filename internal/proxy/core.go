@@ -58,14 +58,15 @@ type Core struct {
 	// onAck reports an agent ack upstream (broker Ack{seq}); nil in standalone.
 	onAck func(seq uint64)
 
-	mu       sync.Mutex
-	appToken string
-	agent    *websocket.Conn
-	agentSeq int  // attach counter, labels log lines
-	ready    bool // current attach has heartbeated
-	pending  []pendingEvent
-	seqByID  map[string]uint64
-	maxAcked uint64
+	mu             sync.Mutex
+	appToken       string
+	agent          *websocket.Conn
+	agentSeq       int  // attach counter, labels log lines
+	ready          bool // current attach has heartbeated
+	egressInFlight int
+	pending        []pendingEvent
+	seqByID        map[string]uint64
+	maxAcked       uint64
 }
 
 type pendingEvent struct {
@@ -97,15 +98,17 @@ func (c *Core) AppToken() string {
 	return c.appToken
 }
 
-// AgentAttached reports whether an agent WS is currently attached; it drives
-// /readyz. Gating readiness on attachment does double duty: ResumeActor's
-// gate waits out the local reconnect churn, and the golden checkpoint cannot
-// fire while the agent is mid-startup (a Node process frozen mid-V8-boot
-// SIGILLs on restore).
-func (c *Core) AgentAttached() bool {
+// AgentQuiescent reports whether the agent is attached, has heartbeated on
+// the current connection, and has no Web API call in flight; it drives
+// /readyz. Readiness gates two checkpoints: ResumeActor's wait (so delivery
+// only proceeds once the local reconnect churn has settled) and the golden
+// snapshot (substrate checkpoints as soon as readyz is green). A Node process
+// frozen while non-quiescent — mid-V8-startup or mid-HTTP-request — has been
+// observed to SIGILL on restore, so readiness means "safe to checkpoint".
+func (c *Core) AgentQuiescent() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.agent != nil
+	return c.agent != nil && c.ready && c.egressInFlight == 0
 }
 
 // LastContiguousAcked is the resume point for the broker Announce: every
@@ -217,11 +220,20 @@ func (c *Core) OnAgentAck(envelopeID string) {
 	}
 }
 
-// Egress relays an agent Web API call via the configured upstream.
+// Egress relays an agent Web API call via the configured upstream. The
+// in-flight window blocks readiness (see AgentQuiescent).
 func (c *Core) Egress(method, path string, header http.Header, body []byte) (*EgressResult, error) {
 	if c.egress == nil {
 		return nil, fmt.Errorf("local-proxy: no egress path configured")
 	}
+	c.mu.Lock()
+	c.egressInFlight++
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.egressInFlight--
+		c.mu.Unlock()
+	}()
 	return c.egress(method, path, header, body)
 }
 

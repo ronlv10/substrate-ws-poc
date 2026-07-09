@@ -61,12 +61,12 @@ func (s *SlackFace) Handler() http.Handler {
 	return mux
 }
 
-// ReadyzHandler serves /readyz on :80: 200 only while the agent WS is
-// attached (see Core.AgentAttached for why).
+// ReadyzHandler serves /readyz on :80: 200 only while the agent is quiescent
+// (see Core.AgentQuiescent for why).
 func (s *SlackFace) ReadyzHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.core.AgentAttached() {
-			http.Error(w, "agent not connected", http.StatusServiceUnavailable)
+		if !s.core.AgentQuiescent() {
+			http.Error(w, "agent not quiescent", http.StatusServiceUnavailable)
 			return
 		}
 		fmt.Fprintln(w, "ok")

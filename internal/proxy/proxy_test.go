@@ -238,3 +238,38 @@ func TestStandaloneStubsEcho(t *testing.T) {
 		t.Fatalf("chat.postMessage stub: %v %+v", err, res)
 	}
 }
+
+func TestReadyzRequiresQuiescence(t *testing.T) {
+	core, srv := newTestFace(t)
+	if core.AgentQuiescent() {
+		t.Fatal("quiescent with no agent")
+	}
+	agent := dialAgent(t, srv)
+	if core.AgentQuiescent() {
+		t.Fatal("quiescent before heartbeat")
+	}
+	agent.heartbeat(t)
+	waitForQ := func(want bool) {
+		deadline := time.Now().Add(2 * time.Second)
+		for core.AgentQuiescent() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("quiescence never became %v", want)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitForQ(true)
+
+	// An in-flight egress blocks readiness until it resolves.
+	release := make(chan struct{})
+	core.SetEgress(func(string, string, http.Header, []byte) (*EgressResult, error) {
+		<-release
+		return &EgressResult{Status: 200}, nil
+	})
+	done := make(chan struct{})
+	go func() { core.Egress("POST", "/api/auth.test", nil, nil); close(done) }()
+	waitForQ(false)
+	close(release)
+	<-done
+	waitForQ(true)
+}
