@@ -375,4 +375,114 @@ ko build github.com/agent-substrate/substrate/cmd/ateom-gvisor   # digest → AT
   Slack connection per app-token/actor (the per-actor vs per-app concern from v1).
 - `/readyz` timing: fast enough that `ResumeActor` returns quickly, but only green
   once the proxy can actually serve the agent.
-```
+
+---
+
+## 14. Warm restore: why v1's Socket Mode churned, and the fix
+
+v1 resumes **cold** (`onPause: Data` → the actor process restarts from scratch on
+every resume). That is reliable but throws away all process memory. The reason we
+fell back to cold boot is that **warm** restore (`onPause: Full`, resume with the
+heap intact) reliably *churned* and dropped the just-delivered event. This section
+records exactly why — grounded in `@slack/socket-mode@1.3.6` (what Bolt 3.22 bundles
+into the actor) and our broker — and the concrete fix, so v2 doesn't rediscover it.
+
+### 14.1 Root cause
+
+Warm restore reanimates the actor's Socket Mode client holding
+**{a dead socket + a stale wall-clock pong timestamp + live heartbeat timers}**, and
+the SDK's only recovery path is the *graceful smooth-reconnect* designed for a
+still-alive socket. Applied to an already-dead socket it is the wrong path.
+
+State trace (SDK line refs are `dist/SocketModeClient.js`):
+
+1. **Checkpoint** freezes the client in `Connected/Ready`: `this.websocket` = a live
+   WS to the broker, two timers armed, `lastPongReceivedTimestamp` = a wall-clock
+   value. Broker sees the TCP tear down → `Detach(sink)` → `s.sink = nil`
+   (`cmd/egress-broker/registry.go` `Detach`), event buffer retained.
+2. A Slack message arrives → broker acks Slack immediately (`registry.go` `readSlackUntilClose`),
+   buffers, `sink==nil && !resuming` → sets `resuming=true`, calls `ResumeActor`.
+3. **Warm restore.** The process is thawed with the state machine *still Connected/Ready*.
+   The client **believes it is connected** and does **not** dial
+   `apps.connections.open` → no new WS, no broker `Attach`, no heartbeat, `resuming`
+   stuck `true`, event stuck in the buffer. Meanwhile:
+   - **`/readyz` on :80 answers 200 instantly** (the HTTP server is in the restored
+     heap) → substrate's `ResumeActor` readiness gate reports the actor **ready**
+     while its Socket Mode layer is dead. The "resume-then-deliver is safe" guarantee
+     silently breaks. (Cold boot has no such gap: the :80 server doesn't exist until
+     the process boots, so readyz ≈ app-startup.)
+   - **~1.7 s later** the client-ping interval (`clientPingTimeoutMillis/3`, ~line 511)
+     fires and hits two clock landmines at once: `this.websocket.ping()` on a **dead
+     FD** throws → `handlePingPongErrorReconnection()`; and the pong-age check uses
+     **wall clock** (`new Date().getTime()`, ~line 512/532) so `now - lastPong` = the
+     whole suspend duration `> clientPingTimeoutMillis` → both fire
+     `ServerPongsNotReceived`. The dead primary's `ws` also emits `close`/`error` →
+     `WebSocketClose`. Multiple concurrent reconnect triggers.
+4. **The churn.** `Reconnecting.do()` sets `isSwitchingConnection = true` (~line 206).
+   The reconnect transition ran `markCurrentWebSocketAsInactive()` (~line 184), which
+   flips flags but **does not clear `this.websocket`** — so on re-auth
+   `setupWebSocket()` sees `this.websocket !== undefined` and builds a **secondary**
+   (~line 415), i.e. the smooth-reconnect path. Spurious `close`/`error` from the dead
+   primary interleave with the switch and can knock the machine back into
+   `Reconnecting` *after* it promoted the good socket, tearing it down again. Net: the
+   client either **wedges** with the dead socket as `this.websocket` (its heartbeat
+   never reaches the broker → `MarkReady` never fires → event never delivered → the
+   observed *"sent multiple times, nothing"*), or it churns and a delivery lands on a
+   sink torn down mid-cycle. Slack won't redeliver — the broker already acked it.
+
+Our broker is already heavily armored against ordinary churn — buffer-until-ack,
+redeliver-on-every-`Attach`, deliver only on the client's first heartbeat
+(`server.go` `SetPingHandler` → `session.MarkReady`), fresh per-delivery
+`envelope_id`. Those defenses are necessary but **not sufficient** here, because warm
+restore can prevent the client from ever presenting a single clean Ready connection
+that heartbeats once.
+
+### 14.2 Why cold boot dodges all of it
+
+The process restarts → one `app.start()` → one `apps.connections.open` → one
+**primary** socket → clean `hello → Ready → first heartbeat`, and `/readyz` tracks
+that. No stale timers, no dead FD, no secondary, no spurious events. Reliable — at the
+cost of discarding the heap.
+
+### 14.3 The fix (implemented as a v1 spike on `ws-poc-v2`)
+
+Two halves: make the actor recover *cleanly*, and make readiness tell the *truth*.
+
+**Actor side — turn the churn into one deterministic restart, keep the heap
+(`echo-actor/app.js`):**
+- **Freeze-gap restore detector.** A 250 ms `setInterval` records `Date.now()`; a tick
+  observing a multi-second gap could only have been frozen → we were checkpointed.
+  No substrate hook needed; robust to any suspend duration.
+- **On detect, hard-reset the WS layer only:** `await app.stop(); await app.start();`.
+  `stop()` drives the SDK's `Disconnecting` → `terminateAllConnections()` +
+  `removeAllListeners()` (kills the dead primary **and its spurious events**) +
+  `terminateActiveHeartBeatJobs()`; `start()` builds a single fresh **primary** with
+  fresh timers and a fresh pong timestamp — the reliable cold-boot code path, but
+  preserving process memory (the `echoed` de-dupe `Set`, V8 JIT warmth, and — in a
+  real agent — in-memory context). Sidesteps §14.1's landmines by construction.
+
+**Broker/substrate side — stop lying about readiness:**
+- **`/readyz` reflects Socket Mode connectivity, not process liveness.** Drive it from
+  the client's real state events (`app.receiver.client` emits
+  `connecting|connected|reconnecting|disconnecting|disconnected`): 200 only after
+  `connected`, 503 the instant a (re)connect starts. Then `ResumeActor`'s gate waits
+  for the *real* WS and the resume-then-deliver guarantee holds under warm restore.
+- **Keep** the existing buffer-until-ack + fresh-`envelope_id` + `MarkReady`-on-first-
+  heartbeat machinery — now *sufficient*, because the two changes above guarantee a
+  single clean Ready connection that heartbeats exactly once.
+
+### 14.4 Why v2 makes this structural (not a patch)
+
+v1's actor↔broker socket is **external**, so it is dead on restore no matter how
+cleanly you reconnect — §14.3's actor-side reset is the best v1 can do. v2's sidecar
+fixes it at the root: the agent↔proxy socket is **in-sandbox loopback**, so it
+survives the checkpoint (pending §8.1 / §13's first open question); only the
+proxy→broker leg reconnects, and the proxy is a purpose-built reconnector with **none**
+of the SDK's smooth-reconnect baggage. The agent's Socket Mode client never sees a
+dead socket. That is precisely why "resume with memory" is a v2 property.
+
+**When warm restore is worth its cost:** for the echo PoC the heap is trivial, so cold
+boot wins on simplicity. Warm restore earns its cost for a real agent — large heap,
+in-memory LLM context and tool caches, JIT warmth — where resuming in ~one
+`apps.connections.open` RTT instead of a full `app.start()` + module load is a real
+latency and correctness win.
