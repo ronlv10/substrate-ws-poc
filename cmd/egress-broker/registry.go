@@ -231,8 +231,8 @@ func (s *session) runSlack(stop <-chan struct{}) {
 			continue
 		}
 		s.reg.log.Info("egress-broker: persistent Slack connection established", slog.String("actor", s.ref.String()))
-		backoff = time.Second
 
+		started := time.Now()
 		s.readSlackUntilClose(conn, stop)
 		conn.Close()
 
@@ -240,6 +240,18 @@ func (s *session) runSlack(stop <-chan struct{}) {
 		case <-stop:
 			return
 		default:
+		}
+
+		// Dial cannot fail fast (slack-go connects asynchronously), so a bad
+		// token or unreachable Slack surfaces as a short-lived connection.
+		// Back off on those; a connection that lived a while resets the delay.
+		if time.Since(started) < 30*time.Second {
+			if !sleepOrStop(stop, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+		} else {
+			backoff = time.Second
 		}
 	}
 }
