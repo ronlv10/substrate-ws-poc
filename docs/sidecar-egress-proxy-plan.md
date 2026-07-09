@@ -1,7 +1,10 @@
 # Plan — Sidecar egress-proxy evolution for suspendable Slack agents (ws-poc v2)
 
-> Status: proposal / to be implemented on a new **`ws-poc-v2` branch** of the
-> existing PoC repos (§12) on a **fresh kind cluster**.
+> Status: **implemented on the `ws-poc-v2` branch** (fresh kind cluster;
+> phase-0 spikes under `spikes/`, proxy under `cmd/local-proxy` +
+> `internal/proxy`, protocol under `proto/brokerproxy`). Findings from the
+> spikes and implementation are folded in below, marked **[VERIFIED]** where
+> the original design's assumptions were tested.
 > Supersedes the v1 "agent connects directly to the egress broker" design.
 
 ---
@@ -82,10 +85,18 @@ proxy. The agent↔proxy socket survives resume. The proxy↔broker socket dies 
 resume but the proxy is **our** code, purpose-built to reconnect cleanly and
 invisibly.
 
-### Bonus: heartbeat problem also disappears
-The agent's Bolt heartbeat ping is answered by the **co-resident** proxy, which
-shares the same frozen monotonic clock and restores together — so on resume the
-pong is "immediately" there in the agent's timeline. No timeout, no churn.
+### Heartbeats: the churn relocates, it does not disappear **[VERIFIED]**
+The spike (`spikes/boltloop`) settled this: the loopback socket itself
+survives restore (ping/pong exchanged on the original connection afterwards),
+but the stock `@slack/socket-mode` client **still reconnects on every warm
+restore** — its pong/ping staleness checks use the wall clock, and gVisor
+advances both the wall and monotonic clocks by the suspend duration on
+restore. The difference from v1 is that the churn is now a ~40 ms loopback
+ritual against a cooperative server: the proxy holds event delivery until the
+(re)attached connection proves itself with a heartbeat ping, so nothing can
+land in the churn window (an event written during it is silently dropped —
+reproduced 4/4 in the spike). Delivered-after-heartbeat events were 100%
+reliable, with original envelope ids and no duplicates.
 
 ---
 
@@ -178,13 +189,14 @@ Wake:
 Transport: **gRPC bidi stream** (preferred; typed, backpressure, easy reconnect)
 or a WebSocket. Not a MITM of Slack Socket Mode.
 
-Messages:
+Messages (implemented in `proto/brokerproxy/v1/brokerproxy.proto`):
 - `proxy → broker`
   - `Announce { atespace, name, app_token, last_acked_seq }` — first frame on every
     (re)connect; identifies the actor and lets the broker resume the stream.
   - `Ack { seq }` — event fully handled (agent acked it).
-  - `Egress { method, path, headers, body }` — relay agent's outbound Slack Web API
-    (chat.postMessage, etc.); broker forwards to real Slack, returns `EgressResp`.
+  - `Egress { corr_id, method, path, headers, body }` — relay agent's outbound
+    Slack Web API (chat.postMessage, etc.); broker forwards to real Slack,
+    returns the matching `EgressResp`.
 - `broker → proxy`
   - `Event { seq, payload }` — a real Slack event to deliver to the agent.
   - `EgressResp { corr_id, status, headers, body }`.
@@ -200,9 +212,12 @@ per-actor token. Identity of record is the `Announce`, not the transport.
 
 ## 6. Redirect & trust (much smaller blast radius than v1)
 
-- **Redirect:** per-image `/etc/hosts` (or pod `HostAliases`) `slack.com`,
+- **Redirect:** per-image `/etc/hosts` mapping `slack.com`,
   `wss-primary.slack.com` → `127.0.0.1`. **No cluster-wide CoreDNS rewrite.** Only
-  actors that ship the proxy + hosts entry are affected.
+  actors that ship the proxy + hosts entry are affected. **[VERIFIED]** atelet
+  mounts nothing over `/etc/hosts`, so the image's copy is what the sandbox
+  resolves with (`HostAliases` is not a mechanism substrate actors have — the
+  image file is the whole story).
 - **Trust:** a CA baked into the actor image + `NODE_EXTRA_CA_CERTS`. **No
   node-level CA install, no atelet CA bind-mount.** Per-image, opt-in.
 - This directly resolves v1's "cluster-wide blast radius" caveat and matches the
@@ -227,30 +242,30 @@ sandbox. Options (validate in §8):
 
 ---
 
-## 8. Risks & spikes — DO THESE FIRST, before building the full thing
+## 8. Risks & spikes — RESULTS (run 2026-07-09, `spikes/`)
 
-Ordered; each is a tiny standalone experiment.
-
-1. **[CRITICAL] Loopback survives gVisor checkpoint/restore.**
-   Spike: a minimal image with two processes — a server on `127.0.0.1:9000` and a
-   client holding an open connection exchanging a heartbeat every 1s. Run as a
-   substrate actor, suspend, resume, and verify the *same* connection is alive and
-   still exchanging heartbeats (no reconnect, no reset) after restore.
-   - PASS → the whole design is unlocked.
-   - FAIL → fall back to "agent reconnects to localhost proxy": still far better
-     (local, instant, cooperative proxy that holds the event and feeds it on a
-     clean single connection). Re-scope, don't abandon.
-2. **Redirect works in-sandbox:** `slack.com` → `127.0.0.1` via `/etc/hosts` or
-   `HostAliases` inside the gVisor actor (confirm substrate doesn't clobber
-   `/etc/hosts`).
-3. **Two-process actor container** boots under substrate, `/readyz` passes, both
-   processes run, and both are checkpointed/restored together.
-4. **TLS on localhost:** Bolt (Node) trusts the baked CA for `slack.com` presented
-   by the local proxy over loopback.
-5. **Identity source** (`/run/ate`) is correct for the proxy on a real (non-golden)
-   actor; confirm the golden-contamination fix path (§9).
-
-Only after 1–3 pass do we build the broker↔proxy protocol and full E2E.
+1. **[CRITICAL] Loopback survives gVisor checkpoint/restore — PASS.**
+   `spikes/loopback`: one dial, one accept, zero errors across the
+   golden-snapshot instantiation plus 3 explicit suspend/resume cycles; the
+   heartbeat seq continued on the same connection and ephemeral port every
+   time. Bonus finding: the connection even survives golden→derived
+   instantiation (each derived actor resumes its own copy of the golden's
+   connection). Wall and monotonic clocks both jump by the suspend duration.
+2. **Redirect works in-sandbox — PASS.** Image-baked `/etc/hosts` resolves
+   `slack.com → 127.0.0.1` under netgo; substrate does not clobber it.
+3. **Two-process actor container — PASS.** PID-1 supervisor + child, both
+   checkpointed/restored together, `/readyz` gating works.
+4. **TLS on localhost — PASS.** Bolt trusts the image-baked CA via
+   `NODE_EXTRA_CA_CERTS` for the proxy's static `slack.com` leaf.
+5. **Identity source — PASS** (see §9: contamination does not reproduce).
+6. **NEW FINDING — checkpoint quiescence.** `spikes/boltloop` + the echo
+   actor: a Node process checkpointed while busy (mid-V8-startup, or holding
+   an in-flight HTTP request with retry timers) **SIGILLs on restore**; a
+   settled Node restores reliably (4/4, repeatedly). Consequence: `/readyz`
+   must be green only once the agent is attached and has heartbeated, so both
+   the golden checkpoint and broker-driven suspends capture a quiet process.
+   Readiness must NOT wait for in-flight egress to drain — a retrying client
+   would hold readyz hostage and deadlock golden creation.
 
 ---
 
@@ -261,18 +276,14 @@ and `/run/ate/atespace` report the **golden** actor's identity (`ate-golden/<uui
 rather than the real actor (`demo/echo-1`) — even on `--boot`. This poisons *any*
 identity mechanism that reads `/run/ate`.
 
-Options for v2:
-- (a) **Fix `atelet`** (substrate fork) so the per-actor identity dir always
-  reflects the real `atespace/actor-id` for golden-derived / booted actors — the
-  proper fix. Investigate `cmd/atelet/main.go` `prepareOCIBundles` / identityDir
-  bind-mount reuse.
-- (b) **Alternative identity source** for the proxy: e.g. downward-API/env unique
-  per actor, or the proxy queries the control API for its own identity by a
-  substrate-provided token. Less clean.
-- (c) **Disable golden snapshot** for this template (always boot from image), if
-  that yields a correct `/run/ate`. Costs the golden fast-start.
-
-Track as a hard dependency; the proxy's `Announce` is only as correct as `/run/ate`.
+**[VERIFIED — does not reproduce; no fork changes needed.]** The spike showed
+the identity mount is regenerated on every resume and reads correctly
+(`demo/spike-2`, not `ate-golden/…`) for golden-derived actors — **as long as
+it is read after the restore**. Reads taken at process start execute in the
+golden era and see the golden identity; that is what poisoned v1. The rule the
+proxy implements: read `/run/ate` fresh on every broker (re)connect, never
+cache. The fork's `ws-poc` branch is still required for the
+`/run/ate/atespace` write itself (commit 5fdfb813).
 
 ---
 
@@ -444,7 +455,7 @@ The process restarts → one `app.start()` → one `apps.connections.open` → o
 that. No stale timers, no dead FD, no secondary, no spurious events. Reliable — at the
 cost of discarding the heap.
 
-### 14.3 The fix (implemented as a v1 spike on `ws-poc-v2`)
+### 14.3 The v1-side fix (designed, never implemented — superseded by v2's proxy)
 
 Two halves: make the actor recover *cleanly*, and make readiness tell the *truth*.
 
@@ -474,12 +485,16 @@ Two halves: make the actor recover *cleanly*, and make readiness tell the *truth
 ### 14.4 Why v2 makes this structural (not a patch)
 
 v1's actor↔broker socket is **external**, so it is dead on restore no matter how
-cleanly you reconnect — §14.3's actor-side reset is the best v1 can do. v2's sidecar
-fixes it at the root: the agent↔proxy socket is **in-sandbox loopback**, so it
-survives the checkpoint (pending §8.1 / §13's first open question); only the
-proxy→broker leg reconnects, and the proxy is a purpose-built reconnector with **none**
-of the SDK's smooth-reconnect baggage. The agent's Socket Mode client never sees a
-dead socket. That is precisely why "resume with memory" is a v2 property.
+cleanly you reconnect — §14.3's actor-side reset is the best v1 could have done.
+v2's sidecar fixes it at the root: the agent↔proxy socket is **in-sandbox
+loopback** and survives the checkpoint (**[VERIFIED]**, §8.1); only the
+proxy→broker leg reconnects, and the proxy is a purpose-built reconnector with
+**none** of the SDK's smooth-reconnect baggage. One honest amendment from the
+spikes: the agent's Socket Mode client still *chooses* to reconnect locally
+after each restore (wall-clock staleness, §2) — but it never sees a dead
+socket mid-delivery, because the proxy holds events until the settled
+connection heartbeats. "Resume with memory" holds: the heap (dedup set, app
+state) survives; the reconnect costs one loopback `apps.connections.open`.
 
 **When warm restore is worth its cost:** for the echo PoC the heap is trivial, so cold
 boot wins on simplicity. Warm restore earns its cost for a real agent — large heap,
