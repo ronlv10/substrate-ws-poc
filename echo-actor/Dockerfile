@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# The Bolt (Node) echo actor image. Built by the Makefile (build-actor-image),
-# which first cross-compiles the suspend-self Go helper into this directory.
+# The Bolt (Node) echo actor image. Built by the Makefile (build-actor-image).
 #
 # The app is bundled into a single file with ncc so cold start touches a handful
 # of files instead of a large node_modules tree — filesystem access is the slow
@@ -31,5 +30,4 @@ RUN npx ncc build app.js -o /dist
 
 FROM node:22-slim
 COPY --from=build /dist/index.js /app/app.js
-COPY suspend-self /suspend-self
 CMD ["node", "/app/app.js"]

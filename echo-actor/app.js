@@ -12,38 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// echo-actor: a stock Slack Bolt (Node) bot that replies "echo: <message>"
-// in-thread. It is an ordinary Bolt Socket Mode app with NO knowledge of its own
-// lifecycle: it does not suspend, resume, or checkpoint itself, and it makes no
-// substrate control-plane calls. It just connects to slack.com and echoes; the
-// broker is interposed transparently (cluster DNS points slack.com at the broker;
-// the broker's CA is trusted via NODE_EXTRA_CA_CERTS), holds the real Slack
-// connection while this actor is suspended, resumes the actor when a message
-// arrives, and SUSPENDS it again from the outside once it goes idle.
+// echo-actor is a Slack Bolt (Node) bot that replies "echo: <message>" in-thread.
 //
-// The only substrate-aware line is reading /run/ate to learn its own actor id,
-// which it forwards to the broker as a header (so the broker can key the session
-// to it). Everything else is plain Bolt.
-//
-// The image ships this bundled into a single file (via ncc) so cold start is a
-// handful of file reads rather than a walk over a large node_modules tree —
-// which matters because filesystem access is the slow path under gVisor.
+// It is bundled into a single file with ncc so cold start touches a handful of
+// files instead of a large node_modules tree — filesystem access is the slow path
+// under gVisor.
 
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
 
-// actorRef reads this actor's substrate identity FRESH from the per-resume
-// identity mount atelet writes (/run/ate/atespace, /run/ate/actor-id) and returns
-// "<atespace>/<name>". We send it to the broker as an X-Ate-Actor header so the
-// broker identifies the actor DETERMINISTICALLY (no source-IP → ListActors race).
+// actorRef reads this actor's substrate identity (/run/ate/atespace,
+// /run/ate/actor-id) and returns "<atespace>/<name>", sent to the broker as the
+// X-Ate-Actor header so it can key the session to this actor.
 //
-// It MUST be read fresh per request, not cached: an actor restored from a golden
-// snapshot keeps in memory whatever it read at startup (the *golden* template
-// actor's id), but the mounted file is regenerated per-resume and is correct
-// (verified: demo:echo-1/identity holds id=echo-1). So we read it inside the
-// https hook below, which runs on every apps.connections.open — including Bolt's
-// reconnect after a restore — guaranteeing the current id.
+// It MUST be read fresh per request, never cached: an actor restored from a
+// golden snapshot holds whatever id it read at startup (the template's), but the
+// mounted file is regenerated on every resume and is correct.
 function actorRef() {
   try {
     const atespace = fs.readFileSync("/run/ate/atespace", "utf8").trim();
@@ -56,10 +41,9 @@ function actorRef() {
   return "";
 }
 
-// Inject X-Ate-Actor (read fresh) on every HTTPS request to slack.com. The Slack
-// SDK (web-api 6) has no per-request header hook, and the actor process can't be
-// relied on to cold-boot and re-read a cached value, so we patch at the transport
-// layer. This is the request the broker reads to identify us on apps.connections.open.
+// Inject the X-Ate-Actor header (read fresh) on every HTTPS request to slack.com.
+// The Slack web-api SDK has no per-request header hook, so patch at the transport
+// layer; the broker reads this header on apps.connections.open to identify us.
 function hostOf(options) {
   if (typeof options === "string") { try { return new URL(options).hostname; } catch { return ""; } }
   return (options && (options.hostname || options.host)) || "";
@@ -91,28 +75,13 @@ http
 // until flush), while stderr is unbuffered.
 const log = (...a) => console.error("echo-actor:", ...a);
 
-// No self-suspend: the actor does NOT manage its own lifecycle. The broker
-// suspends it from the outside when it goes idle. Self-suspending is a checkpoint
-// taken mid-call, which — with onPause=Data — kills the actor's process before the
-// call returns and jams it in SUSPENDING. External (broker) suspend is clean.
-
-log("actor identity (at startup):", actorRef() || "(none)");
-
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
-  logLevel: LogLevel.DEBUG,
-  // Identity is NOT set here (that would cache a value that goes stale after a
-  // golden-snapshot restore). The X-Ate-Actor header is injected fresh per
-  // request by the https.request patch above.
-});
-
-// Diagnostic: log every event Bolt dispatches through middleware, so we can see
-// whether events reach the dispatcher and what type they are.
-app.use(async ({ payload, body, next }) => {
-  log("middleware:", "payload.type=", payload && payload.type, "event.type=", body && body.event && body.event.type);
-  await next();
+  logLevel: LogLevel.INFO,
+  // Identity is injected per-request by the https patch above, not set here: a
+  // value cached here goes stale after a golden-snapshot restore.
 });
 
 // De-dupe: a channel message that mentions the bot can arrive as BOTH a
@@ -139,7 +108,7 @@ async function echoReply(event, say) {
 }
 
 // Handle both plain channel messages and @-mentions (mentions arrive as
-// app_mention; the previous Go actor accepted both, which is why it echoed).
+// app_mention).
 app.message(async ({ message, say }) => echoReply(message, say));
 app.event("app_mention", async ({ event, say }) => echoReply(event, say));
 

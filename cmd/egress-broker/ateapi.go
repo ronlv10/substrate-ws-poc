@@ -42,12 +42,11 @@ type Resumer interface {
 	Resume(ctx context.Context, ref ActorRef) error
 }
 
-// Suspender checkpoints a running actor from the OUTSIDE. The broker drives
-// suspend (rather than the actor suspending itself) because a self-suspend is a
-// checkpoint taken mid-call: with onPause=Data the actor's own process is not
-// preserved, so it kills itself mid-SuspendActor and the checkpoint is canceled
-// (the actor jams in SUSPENDING). An external caller is not part of the
-// checkpoint, so it completes cleanly — exactly like the platform's golden snapshot.
+// Suspender checkpoints a running actor from the OUTSIDE. Suspend must be driven
+// by the broker, not the actor itself: a self-suspend is a checkpoint taken
+// mid-call, so the actor's process freezes before SuspendActor returns and the
+// checkpoint jams. An external caller is not part of the checkpoint, so it
+// completes cleanly.
 type Suspender interface {
 	Suspend(ctx context.Context, ref ActorRef) error
 }
@@ -66,9 +65,8 @@ type controlClient struct {
 	flight singleflight.Group
 
 	// bootOnResume makes Resume boot the actor fresh from its image instead of
-	// restoring the checkpoint. Needed for workloads gVisor cannot restore (a
-	// heavy interpreter like CPython trips "inconsistent private memory files
-	// on restore"); a light Go actor restores fine, so this is off by default.
+	// restoring its checkpoint. Off by default; only needed for workloads gVisor
+	// cannot restore.
 	bootOnResume bool
 }
 
@@ -76,10 +74,9 @@ func newControlClient(api ateapipb.ControlClient, bootOnResume bool) *controlCli
 	return &controlClient{api: api, bootOnResume: bootOnResume}
 }
 
-// Resume mirrors the router's resume path (cmd/atenet/internal/router/
-// resumer.go): deduplicate concurrent resumes of the same actor, detach from
-// the caller's context so one caller giving up does not abort the resume, and
-// retry only on Aborted (a concurrent-resume conflict).
+// Resume deduplicates concurrent resumes of the same actor, detaches from the
+// caller's context so one caller giving up does not abort the resume, and retries
+// only on Aborted (a concurrent-resume conflict).
 func (c *controlClient) Resume(ctx context.Context, ref ActorRef) error {
 	ch := c.flight.DoChan(ref.String(), func() (any, error) {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -119,8 +116,9 @@ func (c *controlClient) Suspend(ctx context.Context, ref ActorRef) error {
 	return err
 }
 
-// LocateByPodIP scans actors (optionally page by page) for a RUNNING actor
-// whose assigned worker pod IP matches ip.
+// LocateByPodIP finds the RUNNING actor whose assigned worker pod IP matches ip.
+// It is a linear scan over all actors — used only as a fallback when the actor
+// does not announce its own identity, so the O(actors) cost is acceptable.
 func (c *controlClient) LocateByPodIP(ctx context.Context, ip string) (ActorRef, error) {
 	var pageToken string
 	for {

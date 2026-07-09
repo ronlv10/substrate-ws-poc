@@ -1,7 +1,3 @@
-# Prebuilt Go suspend helper, cross-compiled into this dir by the Makefile
-# before `docker build`. Not source; do not commit.
-suspend-self
-
 # Node build artifacts (bundling happens inside the Docker build).
 node_modules/
 dist/
