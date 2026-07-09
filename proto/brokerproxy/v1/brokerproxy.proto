@@ -1,0 +1,98 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package brokerproxy.v1;
+
+option go_package = "github.com/ronlv10/substrate-ws-poc/proto/brokerproxy/v1;brokerproxypb";
+
+// BrokerProxy is the protocol between the always-on egress broker and the
+// per-actor local proxy that is suspended and resumed with its actor. The
+// stream dies on every actor suspend; the proxy redials on resume and resumes
+// the event stream from its last acknowledged sequence number.
+service BrokerProxy {
+  // Session is one proxy connection. The first ProxyMsg MUST be an Announce;
+  // the broker closes the stream otherwise. Identity of record is the
+  // Announce, not the transport.
+  rpc Session(stream ProxyMsg) returns (stream BrokerMsg);
+}
+
+message ProxyMsg {
+  oneof msg {
+    Announce announce = 1;
+    Ack ack = 2;
+    Egress egress = 3;
+  }
+}
+
+message BrokerMsg {
+  oneof msg {
+    Event event = 1;
+    EgressResp egress_resp = 2;
+  }
+}
+
+// Announce identifies the actor and resumes its event stream. Sent as the
+// first frame on every (re)connect. The proxy reads atespace/name fresh from
+// /run/ate at each connect: the identity mount is regenerated per resume and
+// reads taken before a restore (e.g. in the golden-snapshot era) are stale.
+message Announce {
+  string atespace = 1;
+  string name = 2;
+  // app_token lets the broker open (or keep) the real Slack Socket Mode
+  // connection on the actor's behalf.
+  string app_token = 3;
+  // last_acked_seq resumes the stream: the broker drops buffered events with
+  // seq <= last_acked_seq and re-sends the rest in order.
+  uint64 last_acked_seq = 4;
+}
+
+// Ack reports that the agent fully handled an event (acked it over the
+// loopback Socket Mode connection). The broker drops the buffered event.
+message Ack {
+  uint64 seq = 1;
+}
+
+// Event delivers one real Slack event. payload is the raw Socket Mode
+// envelope JSON ({type, envelope_id, payload}) with its ORIGINAL envelope_id;
+// delivery is at-least-once, so the agent de-duplicates by event timestamp.
+message Event {
+  uint64 seq = 1;
+  bytes payload = 2;
+}
+
+message Header {
+  string name = 1;
+  repeated string values = 2;
+}
+
+// Egress relays an agent's outbound Slack Web API call (chat.postMessage,
+// auth.test, ...) for the broker to forward to real Slack.
+message Egress {
+  // corr_id correlates the EgressResp; unique per proxy connection.
+  uint64 corr_id = 1;
+  string method = 2;
+  // path is the URL path plus raw query, e.g. "/api/chat.postMessage".
+  string path = 3;
+  repeated Header headers = 4;
+  bytes body = 5;
+}
+
+message EgressResp {
+  uint64 corr_id = 1;
+  int32 status = 2;
+  repeated Header headers = 3;
+  bytes body = 4;
+}
