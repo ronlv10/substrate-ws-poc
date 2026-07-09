@@ -1,6 +1,7 @@
 # Plan — Sidecar egress-proxy evolution for suspendable Slack agents (ws-poc v2)
 
-> Status: proposal / to be implemented in a **fresh git worktree** on a **fresh kind cluster**.
+> Status: proposal / to be implemented on a new **`ws-poc-v2` branch** of the
+> existing PoC repos (§12) on a **fresh kind cluster**.
 > Supersedes the v1 "agent connects directly to the egress broker" design.
 
 ---
@@ -275,7 +276,7 @@ Track as a hard dependency; the proxy's `Announce` is only as correct as `/run/a
 
 ---
 
-## 10. Phased implementation (in the fresh worktree)
+## 10. Phased implementation (on the `ws-poc-v2` branch)
 
 - **Phase 0 — Spikes (§8.1–8.3).** Prove loopback-survives + two-process actor +
   redirect. Gate everything on §8.1.
@@ -311,27 +312,53 @@ Each phase ends with a suspend→post→echo→re-suspend E2E on a fresh cluster
 - Substrate fork changes: keep the `/run/ate/atespace` write; add the identity-mount
   fix (§9). The node-CA bind-mount (`ATE_ACTOR_CA_BUNDLE`) is **no longer needed**
   (trust is per-image now) — can be dropped.
+- From v1's final working state (now on `substrate-ws-poc@main`): **broker-driven
+  suspend** (external `SuspendActor` + idle tracking), **`onPause: Data` cold-boot
+  on resume**, the **golden-atespace skip**, and the **fresh-per-request
+  `X-Ate-Actor` identity** all carry forward. In v2 the identity header moves onto
+  the proxy↔broker `Announce` (§5); the rest is reused as-is.
 
 What's deleted: actor-facing Socket Mode MITM in the broker, per-SNI minting in the
 broker, source-IP `LocateByPodIP`, cluster-wide CoreDNS rewrite, node CA installer.
 
 ---
 
-## 12. Fresh worktree & cluster setup
+## 12. Repositories & branching
 
+v2 builds on the **existing** PoC repos — don't start a throwaway repo/module.
+Create a new `ws-poc-v2` branch in each so v1 (the working demo) stays intact on
+its current branch as the reference.
+
+- **PoC repo** — `github.com/ronlv10/substrate-ws-poc` (v1 lives on `main`: the
+  `egress-broker`, `echo-actor`, `deploy/`, and `demo/`). All v2 application code
+  goes here: evolve `cmd/egress-broker/`, add the new `cmd/local-proxy/`, keep
+  `echo-actor/`, add `proto/` for the proxy↔broker protocol (§5), update `deploy/`.
+  ```bash
+  git clone https://github.com/ronlv10/substrate-ws-poc && cd substrate-ws-poc
+  git checkout -b ws-poc-v2 main
+  ```
+- **Substrate fork** — `github.com/ronlv10/substrate`, branch `ws-poc` (holds the
+  atelet CA-mount + atespace-identity change, commit `5fdfb813`). Only branch this
+  if v2 needs *new* substrate-side changes (e.g. the `/run/ate` identity-mount fix
+  from §9). Branch off `ws-poc`, **never** touch `agent-substrate/substrate`
+  upstream and open **no** PR there:
+  ```bash
+  # in the fork checkout:
+  git checkout -b ws-poc-v2 ws-poc
+  ```
+
+Keep v1 as the known-good baseline: `substrate-ws-poc@main` (with `demo/`) and the
+fork's `ws-poc` branch. Do all v2 work on the `ws-poc-v2` branches so the two
+don't entangle.
+
+### Fresh cluster (isolate from any degraded state)
 ```bash
-# From the substrate fork checkout:
-git worktree add ../substrate-wspoc-v2 -b ws-poc-v2   # fresh branch/worktree
-# Fresh kind cluster (isolate from any degraded state):
+# from the substrate fork checkout (on ws-poc-v2):
 KIND_CLUSTER_NAME=kind ./hack/delete-kind-cluster.sh || true
 KIND_CLUSTER_NAME=kind ./hack/create-kind-cluster.sh
 KIND_CLUSTER_NAME=kind ./hack/install-ate-kind.sh --deploy-ate-system
-ko build github.com/agent-substrate/substrate/cmd/ateom-gvisor   # note the digest → ATEOM_IMAGE
-# New PoC repo/module (or a poc/ folder): egress-broker/, local-proxy/, echo-actor/, proto/, deploy/, docs/
+ko build github.com/agent-substrate/substrate/cmd/ateom-gvisor   # digest → ATEOM_IMAGE
 ```
-
-Keep the v1 repo (`substrate-ws-poc`) as the reference; v2 is a clean module so the
-two don't entangle. v1's session work is `git stash`ed and untouched.
 
 ---
 
