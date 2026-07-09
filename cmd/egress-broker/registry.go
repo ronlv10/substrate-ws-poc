@@ -16,33 +16,18 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
 )
 
-// actorSink is the broker's write side of the actor-facing Socket Mode
-// WebSocket. It is an interface so the session's buffering/delivery logic can be
-// unit-tested without a real WebSocket.
-type actorSink interface {
-	// WriteFrame sends one raw Socket Mode frame to the actor.
-	WriteFrame(b []byte) error
-}
-
-// helloFrame is the constant hello a Slack Socket Mode server sends on connect.
-var helloFrame = mustJSON(socketmode.Envelope{Type: socketmode.TypeHello, NumConnections: 1})
-
-func mustJSON(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return b
+// eventSink is the broker's write side toward an actor's local proxy — one
+// Session stream. An interface so the session's buffering/delivery logic is
+// unit-testable without gRPC.
+type eventSink interface {
+	// SendEvent delivers one buffered event (raw Slack envelope, original
+	// envelope_id) with its sequence number.
+	SendEvent(seq uint64, raw []byte) error
 }
 
 // Registry owns one session per actor. A session holds that actor's persistent
@@ -55,16 +40,9 @@ type Registry struct {
 	dialer    SlackDialer
 	log       *slog.Logger
 
-	// deliverDelay holds buffered events for this long after an actor
-	// (re)connects before delivering them, giving a client that reconnects with
-	// churn (Bolt after a checkpoint/restore) time to settle onto a stable
-	// connection first. The timer resets on each reconnect. Zero = deliver
-	// immediately.
-	deliverDelay time.Duration
-
-	// idleGrace is how long the actor's broker-facing connection may be quiet in
-	// both directions (no delivered event, no ack, no forwarded API call;
-	// keepalive pings excluded) before the broker suspends it. Zero disables
+	// idleGrace is how long the actor's proxy stream may be quiet in both
+	// directions (no delivered event, no ack, no relayed API call; gRPC
+	// keepalives excluded) before the broker suspends the actor. Zero disables
 	// broker-driven suspend.
 	idleGrace time.Duration
 
@@ -73,18 +51,17 @@ type Registry struct {
 }
 
 // NewRegistry builds a Registry.
-func NewRegistry(resumer Resumer, suspender Suspender, dialer SlackDialer, deliverDelay, idleGrace time.Duration, log *slog.Logger) *Registry {
+func NewRegistry(resumer Resumer, suspender Suspender, dialer SlackDialer, idleGrace time.Duration, log *slog.Logger) *Registry {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Registry{
-		resumer:      resumer,
-		suspender:    suspender,
-		dialer:       dialer,
-		deliverDelay: deliverDelay,
-		idleGrace:    idleGrace,
-		log:          log,
-		sessions:     make(map[ActorRef]*session),
+		resumer:   resumer,
+		suspender: suspender,
+		dialer:    dialer,
+		idleGrace: idleGrace,
+		log:       log,
+		sessions:  make(map[ActorRef]*session),
 	}
 }
 
@@ -94,19 +71,10 @@ func (r *Registry) GetOrCreate(ref ActorRef) *session {
 	defer r.mu.Unlock()
 	s, ok := r.sessions[ref]
 	if !ok {
-		s = &session{ref: ref, reg: r, freshIDs: make(map[string]uint64)}
+		s = &session{ref: ref, reg: r, nextSeq: 1}
 		r.sessions[ref] = s
 	}
 	return s
-}
-
-// Lookup returns the existing session for ref, or nil if none exists (unlike
-// GetOrCreate it never creates one — used by the passthrough to touch a session
-// only if the actor is actually connected).
-func (r *Registry) Lookup(ref ActorRef) *session {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.sessions[ref]
 }
 
 // session coordinates one actor's Slack connection and message delivery.
@@ -120,29 +88,36 @@ type session struct {
 	closed   bool
 	stop     chan struct{}
 
-	sink       actorSink         // current actor-facing connection; nil when suspended/disconnected
-	resuming   bool              // a resume is in flight (or the actor is booting) — don't trigger another
-	buffer     []pendingEvent    // events awaiting the actor's ack; redelivered on every (re)connect
-	nextKey    uint64            // per-event internal key generator
-	freshIDs   map[string]uint64 // freshly minted actor-facing envelope_id -> event key
-	settled    bool              // true once the post-attach settle delay has elapsed
-	deliverTmr *time.Timer       // fires when the connection is considered settled
+	sink     eventSink      // current proxy stream; nil when suspended/disconnected
+	resuming bool           // a resume is in flight (or the actor is booting) — don't trigger another
+	buffer   []pendingEvent // events awaiting the proxy's ack, in seq order
+	nextSeq  uint64
 
 	// Broker-driven idle suspend. idleTmr fires idleGrace after the last activity
-	// (delivery, ack, or forwarded API call) and suspends the actor from outside.
-	// inFlight counts outstanding actor->Slack forwards (chat.postMessage) so we
+	// (delivery, ack, or relayed API call) and suspends the actor from outside.
+	// inFlight counts outstanding actor->Slack relays (chat.postMessage) so we
 	// never suspend mid-send; suspending guards against a double suspend.
 	idleTmr    *time.Timer
 	inFlight   int
 	suspending bool
 
-	// sinkWrite serializes writes to sink (gorilla permits one writer at a time).
+	// sinkWrite serializes deliveries so re-attach flushes and new events never
+	// interleave out of order.
 	sinkWrite sync.Mutex
 }
 
-// noteActivity resets the idle-suspend timer. Called on every real actor<->broker
-// exchange (event delivered, ack received, API call forwarded) — but NOT on
-// keepalive pings, so a quiet-but-connected actor still ages out and suspends.
+// pendingEvent is a Slack event held until the actor's proxy acknowledges it
+// (which the proxy does only once the agent acked it end-to-end). The envelope
+// is delivered verbatim — original envelope_id — because the proxy owns
+// redelivery timing; the agent additionally de-dupes by message ts.
+type pendingEvent struct {
+	seq uint64
+	raw []byte
+}
+
+// noteActivity resets the idle-suspend timer. Called on every real
+// actor<->broker exchange (event delivered, ack received, API call relayed) —
+// but NOT on keepalives, so a quiet-but-connected actor still ages out.
 func (s *session) noteActivity() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -150,7 +125,7 @@ func (s *session) noteActivity() {
 }
 
 // armIdleLocked (re)arms the idle timer unless the actor is disconnected, a
-// suspend is already in flight, a forward is in flight, or idle suspend is off.
+// suspend is already in flight, a relay is in flight, or idle suspend is off.
 // Caller holds mu.
 func (s *session) armIdleLocked() {
 	if s.idleTmr != nil {
@@ -188,7 +163,7 @@ func (s *session) onIdle() {
 	}
 }
 
-// beginForward marks an actor->Slack forward in progress (chat.postMessage), so
+// beginForward marks an actor->Slack relay in progress (chat.postMessage), so
 // idle suspend holds off until it completes. endForward re-arms.
 func (s *session) beginForward() {
 	s.mu.Lock()
@@ -208,25 +183,13 @@ func (s *session) endForward() {
 	s.mu.Unlock()
 }
 
-// pendingEvent is a Slack event held until the actor acknowledges it. It is kept
-// (not dropped on write) so it survives a client that opens several connections
-// or reconnects mid-startup (e.g. Bolt): the event is redelivered on each
-// attach and only removed once the actor acks it.
-//
-// key is an internal id. Each delivery stamps a FRESH actor-facing envelope_id
-// (mapped back to key via session.freshIDs) so that a client which dedupes by
-// envelope_id — Bolt does — does not silently drop a redelivery as a duplicate.
-// The actor de-dupes echoes by the Slack message ts instead.
-type pendingEvent struct {
-	key uint64
-	raw []byte // original Slack envelope (its envelope_id is rewritten per delivery)
-}
-
 // EnsureStarted records the app-level token and, on first call, starts the
-// persistent Slack read loop. Called from the actor's apps.connections.open.
+// persistent Slack read loop. Called from the proxy's Announce.
 func (s *session) EnsureStarted(appToken string) {
 	s.mu.Lock()
-	s.appToken = appToken
+	if appToken != "" {
+		s.appToken = appToken
+	}
 	if s.started || s.closed {
 		s.mu.Unlock()
 		return
@@ -320,147 +283,72 @@ func (s *session) readSlackUntilClose(conn SlackConn, stop <-chan struct{}) {
 	}
 }
 
-// onEvent buffers a real event and delivers it to the actor, resuming the actor
-// first if it is suspended. The event stays buffered until the actor acks it.
+// onEvent buffers a real event and delivers it to the actor's proxy, resuming
+// the actor first if it is suspended. The event stays buffered until acked.
 func (s *session) onEvent(raw []byte) {
-	frame := append([]byte(nil), raw...) // copy: gorilla reuses read buffers
+	frame := append([]byte(nil), raw...) // copy: the reader may reuse buffers
 
 	s.mu.Lock()
-	pe := pendingEvent{key: s.nextKey, raw: frame}
-	s.nextKey++
+	pe := pendingEvent{seq: s.nextSeq, raw: frame}
+	s.nextSeq++
 	s.buffer = append(s.buffer, pe)
 	sink := s.sink
 	needResume := sink == nil && !s.resuming
 	if needResume {
-		s.resuming = true // held until the actor attaches (or resume errors)
-	}
-	var frames [][]byte
-	if sink != nil && s.settled {
-		frames = [][]byte{s.stampLocked(pe)}
+		s.resuming = true // held until the proxy attaches (or resume errors)
 	}
 	s.mu.Unlock()
 
 	switch {
-	case frames != nil:
-		// Actor is connected and settled: deliver this new event now.
-		s.writeToSink(sink, frames)
-		s.noteActivity()
 	case sink != nil:
-		// Connected but still within the post-attach settle window: leave it
-		// buffered; the settle timer will deliver it.
+		s.writeToSink(sink, []pendingEvent{pe})
+		s.noteActivity()
 	case needResume:
 		go s.resumeActor()
 	}
 }
 
-// stampLocked rewrites an event's envelope_id to a fresh unique id, records the
-// mapping (fresh id -> event key) so a later ack can be matched back, logs the
-// (original, fresh) pair, and returns the frame to send. Caller holds mu.
-//
-// Fresh ids per delivery stop a client that dedupes by envelope_id (Bolt) from
-// dropping a redelivery as a duplicate; the actor de-dupes echoes by message ts.
-func (s *session) stampLocked(e pendingEvent) []byte {
-	if s.freshIDs == nil {
-		s.freshIDs = make(map[string]uint64)
-	}
-	fresh := randID()
-	s.freshIDs[fresh] = e.key
-	orig, _ := socketmode.DecodeEnvelope(e.raw)
-	s.reg.log.Info("egress-broker: delivering event to actor",
-		slog.String("actor", s.ref.String()),
-		slog.String("slack_envelope_id", orig.EnvelopeID),
-		slog.String("actor_envelope_id", fresh))
-	return rewriteEnvelopeID(e.raw, fresh)
-}
-
-// buildEventFramesLocked returns one freshly-stamped frame per buffered event
-// (no hello). Caller holds mu.
-func (s *session) buildEventFramesLocked() [][]byte {
-	frames := make([][]byte, 0, len(s.buffer))
-	for _, e := range s.buffer {
-		frames = append(frames, s.stampLocked(e))
-	}
-	return frames
-}
-
-// writeToSink writes frames to sink in order, under the write lock, bailing if
-// the sink is no longer current or a write fails. Undelivered events remain in
-// the buffer and are redelivered on the next attach.
-func (s *session) writeToSink(sink actorSink, frames [][]byte) {
+// writeToSink delivers events in order, bailing if the sink is no longer
+// current or a send fails. Undelivered events remain in the buffer and are
+// re-sent on the next Attach.
+func (s *session) writeToSink(sink eventSink, events []pendingEvent) {
 	s.sinkWrite.Lock()
 	defer s.sinkWrite.Unlock()
-	for _, f := range frames {
+	for _, e := range events {
 		s.mu.Lock()
 		current := s.sink == sink
 		s.mu.Unlock()
 		if !current {
 			return
 		}
-		if err := sink.WriteFrame(f); err != nil {
-			s.reg.log.Warn("egress-broker: delivering to actor failed; will redeliver on reconnect",
-				slog.String("actor", s.ref.String()), slog.Any("err", err))
+		if err := sink.SendEvent(e.seq, e.raw); err != nil {
+			s.reg.log.Warn("egress-broker: delivering to proxy failed; will re-send on reconnect",
+				slog.String("actor", s.ref.String()), slog.Uint64("seq", e.seq), slog.Any("err", err))
 			return
 		}
 	}
 }
 
-// Ack removes an event from the buffer once the actor acknowledges it. The actor
-// acks the fresh, per-delivery envelope_id, which maps back to the event key.
-func (s *session) Ack(actorEnvelopeID string) {
-	if actorEnvelopeID == "" {
-		return
-	}
+// Ack removes an event from the buffer once the proxy reports the agent
+// handled it.
+func (s *session) Ack(seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key, ok := s.freshIDs[actorEnvelopeID]
-	if !ok {
-		return
-	}
 	for i, e := range s.buffer {
-		if e.key == key {
+		if e.seq == seq {
 			s.buffer = append(s.buffer[:i], s.buffer[i+1:]...)
 			break
-		}
-	}
-	// Drop every fresh id that pointed at this (now-acked) event.
-	for fid, k := range s.freshIDs {
-		if k == key {
-			delete(s.freshIDs, fid)
 		}
 	}
 	s.armIdleLocked() // an ack is real actor->broker activity
 }
 
-// randID returns a short random hex id for actor-facing envelope ids.
-func randID() string {
-	var b [12]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
-// rewriteEnvelopeID returns raw with its top-level "envelope_id" replaced,
-// preserving all other fields. Falls back to raw if it is not a JSON object.
-func rewriteEnvelopeID(raw []byte, fresh string) []byte {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return raw
-	}
-	idJSON, err := json.Marshal(fresh)
-	if err != nil {
-		return raw
-	}
-	m["envelope_id"] = idJSON
-	out, err := json.Marshal(m)
-	if err != nil {
-		return raw
-	}
-	return out
-}
-
 // resumeActor asks substrate to resume the actor. ResumeActor blocks until the
-// actor's readyz returns 200; the actor then reconnects and Attach flushes the
-// buffer. resuming stays set until Attach clears it, preventing duplicate
-// resumes in the window between resume completing and the actor reconnecting.
+// actor's readyz returns 200 — which the proxy answers only once its agent is
+// attached — and the proxy then redials and announces, which flushes the
+// buffer via Attach. resuming stays set until Attach clears it, preventing
+// duplicate resumes in the window between resume completing and the proxy
+// reconnecting.
 func (s *session) resumeActor() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -474,98 +362,44 @@ func (s *session) resumeActor() {
 	}
 }
 
-// Attach registers the actor's Socket Mode connection, sends the hello frame,
-// and (re)delivers every buffered, un-acked event. Called when an actor
-// (re)connects — including when a client like Bolt opens a fresh connection
-// mid-startup, which is why delivery is redone here rather than assumed done.
-func (s *session) Attach(sink actorSink) {
+// Attach registers the proxy's stream, drops everything the proxy already
+// acked (lastAcked, from its Announce), and re-sends the remaining buffer in
+// order. Delivery is immediate: the proxy holds events locally until its agent
+// heartbeats, so the broker no longer second-guesses client readiness.
+func (s *session) Attach(sink eventSink, lastAcked uint64) {
 	s.mu.Lock()
+	kept := s.buffer[:0]
+	for _, e := range s.buffer {
+		if e.seq > lastAcked {
+			kept = append(kept, e)
+		}
+	}
+	s.buffer = kept
 	s.sink = sink
 	s.resuming = false
-	s.settled = false
-	if s.deliverTmr != nil {
-		s.deliverTmr.Stop()
-		s.deliverTmr = nil
-	}
-	delay := s.reg.deliverDelay
-	buffered := len(s.buffer)
+	pending := append([]pendingEvent(nil), s.buffer...)
 	s.mu.Unlock()
 
-	// Send hello immediately so the client can run its handshake; hold events
-	// until it signals ready via its first heartbeat (see MarkReady). If there
-	// is nothing buffered, mark settled now so future events flow immediately.
-	s.writeToSink(sink, [][]byte{helloFrame})
-
-	if buffered == 0 {
-		// Nothing to hold; mark settled so subsequent events flow immediately.
-		s.deliverBufferedNow(sink, "attach")
-		return
+	if len(pending) > 0 {
+		s.reg.log.Info("egress-broker: proxy attached; re-sending unacked events",
+			slog.String("actor", s.ref.String()), slog.Int("count", len(pending)),
+			slog.Uint64("last_acked_seq", lastAcked))
 	}
-	// Hold buffered events until the client's first heartbeat (MarkReady) — its
-	// connected:ready signal. delay>0 arms an optional fallback in case a client
-	// never heartbeats; delay==0 means heartbeat-only (no fallback).
-	s.reg.log.Info("egress-broker: holding buffered events until the client's first heartbeat",
-		slog.String("actor", s.ref.String()), slog.Duration("fallback", delay), slog.Int("buffered", buffered))
-	if delay > 0 {
-		s.mu.Lock()
-		s.deliverTmr = time.AfterFunc(delay, func() { s.deliverBufferedNow(sink, "fallback-timeout") })
-		s.mu.Unlock()
-	}
-}
-
-// MarkReady is called when the actor's connection proves it is established —
-// its first Socket Mode heartbeat ping, which a client (Bolt) starts only once
-// it reaches connected:ready. That is the real "handshake complete" signal, so
-// we deliver buffered events on it instead of guessing with a timer. Called on
-// every heartbeat, but delivery is idempotent per attach.
-func (s *session) MarkReady(sink actorSink) {
-	s.deliverBufferedNow(sink, "heartbeat")
-}
-
-// deliverBufferedNow marks the connection settled and delivers all buffered
-// events (freshly stamped) to sink, if it is still the current connection and
-// has not already been settled for this attach. Idempotent per attach, so it
-// logs (and delivers) at most once per connection. trigger names what caused
-// delivery (heartbeat / fallback / attach) for observability.
-func (s *session) deliverBufferedNow(sink actorSink, trigger string) {
-	s.mu.Lock()
-	if s.sink != sink || s.settled {
-		s.mu.Unlock()
-		return
-	}
-	s.settled = true
-	if s.deliverTmr != nil {
-		s.deliverTmr.Stop()
-		s.deliverTmr = nil
-	}
-	frames := s.buildEventFramesLocked()
-	s.mu.Unlock()
-
-	if len(frames) > 0 {
-		s.reg.log.Info("egress-broker: connection established; delivering buffered events to actor",
-			slog.String("actor", s.ref.String()), slog.Int("count", len(frames)), slog.String("trigger", trigger))
-	}
-	s.writeToSink(sink, frames)
-	// Attaching/delivering is activity: start the idle countdown. A bootstrap
-	// connection with nothing buffered lands here too, so an actor that just
-	// opened its Slack connection with no work also ages out and gets suspended.
+	s.writeToSink(sink, pending)
+	// Attaching is activity: start the idle countdown, so an actor that woke
+	// with no work also ages out and suspends again.
 	s.noteActivity()
 }
 
-// Detach clears the actor connection if it is still the current one. Also fires
-// when the broker suspends the actor and the checkpoint tears down its socket, so
-// it resets the idle-suspend state.
-func (s *session) Detach(sink actorSink) {
+// Detach clears the proxy stream if it is still the current one. Also fires
+// when the broker suspends the actor and the checkpoint tears down the stream,
+// so it resets the idle-suspend state.
+func (s *session) Detach(sink eventSink) {
 	s.mu.Lock()
 	if s.sink == sink {
 		s.sink = nil
-		s.settled = false
 		s.suspending = false
 		s.inFlight = 0
-		if s.deliverTmr != nil {
-			s.deliverTmr.Stop()
-			s.deliverTmr = nil
-		}
 		if s.idleTmr != nil {
 			s.idleTmr.Stop()
 			s.idleTmr = nil

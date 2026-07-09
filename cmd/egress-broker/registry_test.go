@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -25,262 +26,237 @@ import (
 	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
 )
 
-// --- test doubles ---
-
-type fakeFrame struct {
-	env socketmode.Envelope
-	raw []byte
+// fakeSlackConn feeds scripted frames to the session's Slack read loop.
+type fakeSlackConn struct {
+	frames chan []byte
+	acked  chan string
 }
 
-type fakeSlackConn struct {
-	frames []fakeFrame
-	idx    int
-	acks   []string
+func newFakeSlackConn() *fakeSlackConn {
+	return &fakeSlackConn{frames: make(chan []byte, 16), acked: make(chan string, 16)}
 }
 
 func (f *fakeSlackConn) Read() (socketmode.Envelope, []byte, error) {
-	if f.idx >= len(f.frames) {
-		return socketmode.Envelope{}, nil, io.EOF // ends readSlackUntilClose
+	raw, ok := <-f.frames
+	if !ok {
+		return socketmode.Envelope{}, nil, io.EOF
 	}
-	fr := f.frames[f.idx]
-	f.idx++
-	return fr.env, fr.raw, nil
+	env, err := socketmode.DecodeEnvelope(raw)
+	return env, raw, err
 }
+func (f *fakeSlackConn) Ack(id string) error { f.acked <- id; return nil }
+func (f *fakeSlackConn) Close() error        { return nil }
 
-func (f *fakeSlackConn) Ack(id string) error {
-	f.acks = append(f.acks, id)
-	return nil
+type fakeDialer struct{ conn *fakeSlackConn }
+
+func (d *fakeDialer) Dial(ctx context.Context, token string) (SlackConn, error) {
+	return d.conn, nil
 }
-
-func (f *fakeSlackConn) Close() error { return nil }
 
 type fakeResumer struct {
 	mu    sync.Mutex
-	calls []ActorRef
-	done  chan ActorRef
+	count int
 }
 
-func (r *fakeResumer) Resume(_ context.Context, ref ActorRef) error {
-	r.mu.Lock()
-	r.calls = append(r.calls, ref)
-	r.mu.Unlock()
-	if r.done != nil {
-		r.done <- ref
-	}
-	return nil
-}
-
-func (r *fakeResumer) callCount() int {
+func (r *fakeResumer) Resume(ctx context.Context, ref ActorRef) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.calls)
-}
-
-type fakeSink struct {
-	mu     sync.Mutex
-	frames [][]byte
-}
-
-func (s *fakeSink) WriteFrame(b []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.frames = append(s.frames, append([]byte(nil), b...))
+	r.count++
 	return nil
 }
+func (r *fakeResumer) resumes() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
+}
 
-func (s *fakeSink) snapshot() [][]byte {
+type fakeSuspender struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (s *fakeSuspender) Suspend(ctx context.Context, ref ActorRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([][]byte, len(s.frames))
-	copy(out, s.frames)
-	return out
+	s.count++
+	return nil
+}
+func (s *fakeSuspender) suspends() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
 }
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+// fakeSink records delivered (seq, payload) pairs.
+type fakeSink struct {
+	mu     sync.Mutex
+	events []uint64
+	fail   bool
 }
 
-func newTestSession(resumer Resumer) *session {
-	reg := NewRegistry(resumer, nil, nil, 0, 0, discardLogger())
-	return &session{ref: ActorRef{Atespace: "demo", Name: "echo-1"}, reg: reg}
+func (f *fakeSink) SendEvent(seq uint64, raw []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return fmt.Errorf("sink failed")
+	}
+	f.events = append(f.events, seq)
+	return nil
+}
+func (f *fakeSink) delivered() []uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint64(nil), f.events...)
 }
 
-func eventFrame(id string) fakeFrame {
-	raw := []byte(`{"type":"events_api","envelope_id":"` + id + `","payload":{"type":"event_callback"}}`)
-	env, _ := socketmode.DecodeEnvelope(raw)
-	return fakeFrame{env: env, raw: raw}
+func eventFrame(id string) []byte {
+	return []byte(fmt.Sprintf(`{"type":"events_api","envelope_id":%q,"payload":{"type":"event_callback"}}`, id))
 }
 
-// --- tests ---
-
-// Slack keepalive/lifecycle frames must never ack to Slack or wake the actor.
-func TestReadSlackIgnoresConnectionManagement(t *testing.T) {
+func newTestSession(t *testing.T, idleGrace time.Duration) (*session, *fakeSlackConn, *fakeResumer, *fakeSuspender) {
+	t.Helper()
+	conn := newFakeSlackConn()
 	resumer := &fakeResumer{}
-	s := newTestSession(resumer)
-	conn := &fakeSlackConn{frames: []fakeFrame{
-		{env: socketmode.Envelope{Type: socketmode.TypeHello, NumConnections: 1}},
-	}}
+	suspender := &fakeSuspender{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := NewRegistry(resumer, suspender, &fakeDialer{conn: conn}, idleGrace, log)
+	s := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
+	s.EnsureStarted("xapp-test")
+	t.Cleanup(func() { s.Close(); close(conn.frames) })
+	return s, conn, resumer, suspender
+}
 
-	s.readSlackUntilClose(conn, make(chan struct{}))
-
-	if len(conn.acks) != 0 {
-		t.Errorf("acked %v to Slack for a hello frame; want no acks", conn.acks)
-	}
-	if resumer.callCount() != 0 {
-		t.Errorf("resumed the actor for a hello frame; want no resume")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.buffer) != 0 {
-		t.Errorf("buffered %d frames for a hello; want 0", len(s.buffer))
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-// A real event received while the actor is suspended must be acked to Slack,
-// buffered, and trigger exactly one resume.
-func TestRealEventWhileSuspendedResumesActor(t *testing.T) {
-	resumer := &fakeResumer{done: make(chan ActorRef, 4)}
-	s := newTestSession(resumer)
-	conn := &fakeSlackConn{frames: []fakeFrame{eventFrame("env-1"), eventFrame("env-2")}}
-
-	s.readSlackUntilClose(conn, make(chan struct{}))
-
-	// Both events acked to Slack immediately.
-	if len(conn.acks) != 2 || conn.acks[0] != "env-1" || conn.acks[1] != "env-2" {
-		t.Errorf("acks = %v, want [env-1 env-2]", conn.acks)
+func TestKeepaliveFramesNeverResume(t *testing.T) {
+	s, conn, resumer, _ := newTestSession(t, 0)
+	conn.frames <- []byte(`{"type":"hello","num_connections":1}`)
+	conn.frames <- []byte(`{"type":"disconnect","reason":"warning"}`)
+	time.Sleep(100 * time.Millisecond)
+	if got := resumer.resumes(); got != 0 {
+		t.Fatalf("connection-management frames triggered %d resumes", got)
 	}
-	// A resume was triggered.
-	select {
-	case <-resumer.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the actor to be resumed")
-	}
-	// Both events are buffered awaiting the actor's reconnect.
 	s.mu.Lock()
-	bufLen := len(s.buffer)
+	buffered := len(s.buffer)
 	s.mu.Unlock()
-	if bufLen != 2 {
-		t.Errorf("buffered %d events, want 2", bufLen)
+	if buffered != 0 {
+		t.Fatalf("keepalives buffered as events: %d", buffered)
 	}
 }
 
-// Attaching an actor sends hello and (re)delivers the buffered events in order.
-// The events stay buffered until acked, so they survive a reconnect.
-func TestAttachRedeliversBufferedEventsUntilAcked(t *testing.T) {
-	resumer := &fakeResumer{done: make(chan ActorRef, 4)}
-	s := newTestSession(resumer)
-	conn := &fakeSlackConn{frames: []fakeFrame{eventFrame("env-1"), eventFrame("env-2")}}
-	s.readSlackUntilClose(conn, make(chan struct{}))
-	<-resumer.done // let the resume goroutine run
+func TestEventWhileDetachedAcksSlackBuffersAndResumesOnce(t *testing.T) {
+	s, conn, resumer, _ := newTestSession(t, 0)
+	conn.frames <- eventFrame("e1")
+	conn.frames <- eventFrame("e2")
 
+	waitFor(t, "slack acks", func() bool { return len(conn.acked) == 2 })
+	waitFor(t, "buffering", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.buffer) == 2
+	})
+	waitFor(t, "one resume", func() bool { return resumer.resumes() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if got := resumer.resumes(); got != 1 {
+		t.Fatalf("expected exactly one resume, got %d", got)
+	}
+}
+
+func TestAttachDropsAckedAndResendsRestInOrder(t *testing.T) {
+	s, conn, _, _ := newTestSession(t, 0)
+	for i := 1; i <= 3; i++ {
+		conn.frames <- eventFrame(fmt.Sprintf("e%d", i))
+	}
+	waitFor(t, "buffering", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.buffer) == 3
+	})
+
+	// The proxy already acked seq 1 before its last suspend.
 	sink := &fakeSink{}
-	s.Attach(sink)
-
-	// Attach sends only hello; events are held until the client signals ready.
-	if got := sink.snapshot(); len(got) != 1 {
-		t.Fatalf("after attach (pre-heartbeat) actor received %d frames, want 1 (hello only)", len(got))
-	}
-	// The first heartbeat releases the buffered events.
-	s.MarkReady(sink)
-
-	frames := sink.snapshot()
-	if len(frames) != 3 {
-		t.Fatalf("actor received %d frames, want 3 (hello + 2 events)", len(frames))
-	}
-	if got, _ := socketmode.DecodeEnvelope(frames[0]); got.Type != socketmode.TypeHello {
-		t.Errorf("first frame type = %q, want hello", got.Type)
-	}
-	// Delivered events carry FRESH, distinct envelope ids (not Slack's originals),
-	// so a client that dedupes by envelope_id won't drop a redelivery.
-	e1, _ := socketmode.DecodeEnvelope(frames[1])
-	e2, _ := socketmode.DecodeEnvelope(frames[2])
-	if !e1.IsEvent() || !e2.IsEvent() {
-		t.Errorf("delivered frames are not both events: %q, %q", e1.Type, e2.Type)
-	}
-	if e1.EnvelopeID == "" || e2.EnvelopeID == "" || e1.EnvelopeID == e2.EnvelopeID {
-		t.Errorf("expected two distinct fresh envelope ids, got %q and %q", e1.EnvelopeID, e2.EnvelopeID)
-	}
-	if e1.EnvelopeID == "env-1" || e2.EnvelopeID == "env-2" {
-		t.Errorf("envelope ids should be freshly minted, not Slack's originals")
+	s.Attach(sink, 1)
+	got := sink.delivered()
+	if len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("expected re-send of [2 3], got %v", got)
 	}
 
-	// resuming cleared on attach; events remain buffered (un-acked).
+	// New events flow immediately while attached.
+	conn.frames <- eventFrame("e4")
+	waitFor(t, "live delivery", func() bool { return len(sink.delivered()) == 3 })
+	if got := sink.delivered(); got[2] != 4 {
+		t.Fatalf("expected seq 4 delivered live, got %v", got)
+	}
+}
+
+func TestAckRemovesFromBuffer(t *testing.T) {
+	s, conn, _, _ := newTestSession(t, 0)
+	sink := &fakeSink{}
+	s.Attach(sink, 0)
+	conn.frames <- eventFrame("e1")
+	waitFor(t, "delivery", func() bool { return len(sink.delivered()) == 1 })
+
+	s.Ack(1)
 	s.mu.Lock()
-	if s.resuming {
-		t.Error("resuming flag still set after attach")
-	}
-	if len(s.buffer) != 2 {
-		t.Errorf("buffer has %d events, want 2 still pending ack", len(s.buffer))
-	}
+	buffered := len(s.buffer)
 	s.mu.Unlock()
+	if buffered != 0 {
+		t.Fatalf("acked event still buffered: %d", buffered)
+	}
 
-	// A reconnect (new sink) redelivers the still-un-acked events (on its
-	// heartbeat) with NEW fresh ids.
+	// A second attach re-sends nothing.
 	sink2 := &fakeSink{}
-	s.Attach(sink2)
-	s.MarkReady(sink2)
-	redelivered := sink2.snapshot()
-	if len(redelivered) != 3 {
-		t.Fatalf("reconnect redelivered %d frames, want 3 (hello + 2 unacked events)", len(redelivered))
-	}
-
-	// Acking the fresh ids from the latest delivery clears the buffer.
-	r1, _ := socketmode.DecodeEnvelope(redelivered[1])
-	r2, _ := socketmode.DecodeEnvelope(redelivered[2])
-	s.Ack(r1.EnvelopeID)
-	s.Ack(r2.EnvelopeID)
-	s.mu.Lock()
-	if len(s.buffer) != 0 {
-		t.Errorf("buffer has %d events after acking both, want 0", len(s.buffer))
-	}
-	s.mu.Unlock()
-
-	sink3 := &fakeSink{}
-	s.Attach(sink3)
-	s.MarkReady(sink3)
-	if got := sink3.snapshot(); len(got) != 1 {
-		t.Errorf("after acks, attach+ready delivered %d frames, want 1 (hello only)", len(got))
+	s.Attach(sink2, 0)
+	if got := sink2.delivered(); len(got) != 0 {
+		t.Fatalf("acked event re-sent: %v", got)
 	}
 }
 
-// An event that arrives while the actor is already attached is delivered
-// immediately without a resume.
-func TestEventWhileAttachedDeliversWithoutResume(t *testing.T) {
-	resumer := &fakeResumer{}
-	s := newTestSession(resumer)
+func TestFailedSendKeepsEventForNextAttach(t *testing.T) {
+	s, conn, _, _ := newTestSession(t, 0)
+	sink := &fakeSink{fail: true}
+	s.Attach(sink, 0)
+	conn.frames <- eventFrame("e1")
+	waitFor(t, "buffering", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.buffer) == 1
+	})
+
+	sink2 := &fakeSink{}
+	s.Attach(sink2, 0)
+	if got := sink2.delivered(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("expected re-send of [1], got %v", got)
+	}
+}
+
+func TestIdleSuspendFiresAndForwardDefersIt(t *testing.T) {
+	s, _, _, suspender := newTestSession(t, 50*time.Millisecond)
 	sink := &fakeSink{}
-	s.Attach(sink) // hello only
 
-	conn := &fakeSlackConn{frames: []fakeFrame{eventFrame("env-9")}}
-	s.readSlackUntilClose(conn, make(chan struct{}))
+	// An in-flight relay holds off the idle suspend.
+	s.Attach(sink, 0)
+	s.beginForward()
+	time.Sleep(120 * time.Millisecond)
+	if got := suspender.suspends(); got != 0 {
+		t.Fatalf("suspended mid-forward: %d", got)
+	}
+	s.endForward()
+	waitFor(t, "idle suspend", func() bool { return suspender.suspends() == 1 })
 
-	if resumer.callCount() != 0 {
-		t.Errorf("resumed the actor though it was attached; want no resume")
-	}
-	frames := sink.snapshot()
-	// hello + the event (delivered with a fresh envelope id).
-	if len(frames) != 2 {
-		t.Fatalf("actor received %d frames, want 2 (hello + event)", len(frames))
-	}
-	e, _ := socketmode.DecodeEnvelope(frames[1])
-	if !e.IsEvent() {
-		t.Errorf("delivered frame type = %q, want an event", e.Type)
-	}
-	if e.EnvelopeID == "" || e.EnvelopeID == "env-9" {
-		t.Errorf("delivered envelope_id = %q, want a freshly minted id", e.EnvelopeID)
-	}
-}
-
-// Registry keys sessions per actor.
-func TestRegistryGetOrCreateIsPerActor(t *testing.T) {
-	reg := NewRegistry(&fakeResumer{}, nil, nil, 0, 0, discardLogger())
-	a1 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
-	a1b := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
-	a2 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-2"})
-	if a1 != a1b {
-		t.Error("GetOrCreate returned different sessions for the same actor")
-	}
-	if a1 == a2 {
-		t.Error("GetOrCreate returned the same session for different actors")
+	// The checkpoint tears the stream down -> Detach; no further suspends.
+	s.Detach(sink)
+	time.Sleep(120 * time.Millisecond)
+	if got := suspender.suspends(); got != 1 {
+		t.Fatalf("suspend fired while detached: %d", got)
 	}
 }

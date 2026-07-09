@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -51,15 +50,8 @@ type Suspender interface {
 	Suspend(ctx context.Context, ref ActorRef) error
 }
 
-// Locator resolves the actor that owns a given worker-pod source IP. Actor
-// egress is SNAT'd behind the worker pod IP, so the broker sees that IP as the
-// connection's remote address and maps it back to an actor identity.
-type Locator interface {
-	LocateByPodIP(ctx context.Context, ip string) (ActorRef, error)
-}
-
 // controlClient adapts the substrate Control gRPC service to the Resumer and
-// Locator interfaces the broker depends on.
+// Suspender interfaces the broker depends on.
 type controlClient struct {
 	api    ateapipb.ControlClient
 	flight singleflight.Group
@@ -116,24 +108,3 @@ func (c *controlClient) Suspend(ctx context.Context, ref ActorRef) error {
 	return err
 }
 
-// LocateByPodIP finds the RUNNING actor whose assigned worker pod IP matches ip.
-// It is a linear scan over all actors — used only as a fallback when the actor
-// does not announce its own identity, so the O(actors) cost is acceptable.
-func (c *controlClient) LocateByPodIP(ctx context.Context, ip string) (ActorRef, error) {
-	var pageToken string
-	for {
-		resp, err := c.api.ListActors(ctx, &ateapipb.ListActorsRequest{PageSize: 1000, PageToken: pageToken})
-		if err != nil {
-			return ActorRef{}, fmt.Errorf("listing actors: %w", err)
-		}
-		for _, a := range resp.GetActors() {
-			if a.GetAteomPodIp() == ip && a.GetStatus() == ateapipb.Actor_STATUS_RUNNING {
-				return ActorRef{Atespace: a.GetAtespace(), Name: a.GetActorId()}, nil
-			}
-		}
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
-			return ActorRef{}, fmt.Errorf("no running actor found at pod IP %q", ip)
-		}
-	}
-}

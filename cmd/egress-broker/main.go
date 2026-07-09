@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command egress-broker is the WebSocket egress broker: an always-on service
-// that owns the persistent Slack Socket Mode connection on behalf of suspendable
-// substrate actors.
+// Command egress-broker is an always-on service that owns the persistent
+// Slack Socket Mode connection on behalf of suspendable substrate actors.
 //
-// Actors believe they dial slack.com directly; cluster DNS points those
-// hostnames at this broker, which terminates TLS with a per-SNI certificate
-// signed by a CA the actors trust. The broker captures the app-level token from
-// the actor's apps.connections.open, holds the real Slack connection itself,
-// filters keepalive/hello frames, and — when a real message arrives while the
-// actor is suspended — resumes the actor via the substrate Control API and
-// delivers the buffered event when the actor's connection signals ready.
+// Each actor image ships a local proxy that impersonates Slack for its
+// co-resident agent over loopback; the proxy speaks this broker's gRPC
+// Session protocol (proto/brokerproxy). The broker holds the real Slack
+// connection, filters keepalive traffic, buffers events, resumes suspended
+// actors via the substrate Control API when a real message arrives, and
+// suspends idle ones. Identity comes from the proxy's Announce — the broker
+// has no actor-facing TLS, no DNS rewrite, and no source-IP correlation.
 //
 // See README.md for the full design.
 package main
@@ -30,9 +29,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"log/slog"
-	"net/http"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -42,32 +40,24 @@ import (
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+
+	brokerproxypb "github.com/ronlv10/substrate-ws-poc/proto/brokerproxy/v1"
 )
 
 func main() {
 	var (
-		listenAddr   = pflag.String("listen", ":443", "TLS listen address for actor-facing traffic")
-		caCertFile   = pflag.String("ca-cert", "/etc/ws-poc/ca/tls.crt", "Broker CA certificate (PEM) used to mint per-SNI leaves")
-		caKeyFile    = pflag.String("ca-key", "/etc/ws-poc/ca/tls.key", "Broker CA private key (PEM)")
-		dnsUpstream  = pflag.String("dns-upstream", "8.8.8.8:53", "Upstream DNS used to reach REAL Slack, bypassing the cluster DNS redirect")
+		grpcListen   = pflag.String("grpc-listen", ":9090", "Proxy-facing gRPC listen address")
+		dnsUpstream  = pflag.String("dns-upstream", "8.8.8.8:53", "Upstream DNS used to reach real Slack (independent of cluster DNS)")
 		slackAPIBase = pflag.String("slack-api-base", "https://slack.com", "Base URL for real Slack API (override for testing)")
-		wssHost      = pflag.String("wss-host", "wss-primary.slack.com", "Host embedded in the synthesized wss URL; must be DNS-mapped to the broker")
-		wssPath      = pflag.String("wss-path", "/ws-poc/socketmode", "Path the actor's Socket Mode WebSocket connects to")
 		ateapiAddr   = pflag.String("ateapi-address", "api.ate-system.svc:443", "Substrate Control API (ateapi) address")
-		bootOnResume = pflag.Bool("boot-on-resume", false, "Boot actors fresh on resume instead of restoring the checkpoint")
-		deliverDelay = pflag.Duration("deliver-delay", 0, "Fallback: deliver buffered events this long after (re)connect even if no heartbeat is seen. Normally delivery is triggered by the client's first heartbeat (its connected:ready signal). 0 = heartbeat-only")
-		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "Suspend an actor after its broker-facing connection is quiet in both directions (no event, ack, or forwarded API call; keepalive pings excluded) for this long. 0 disables broker-driven suspend")
+		bootOnResume = pflag.Bool("boot-on-resume", false, "Boot actors fresh on resume instead of restoring the checkpoint (defeats warm restore; debugging only)")
+		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "Suspend an actor after its proxy stream is quiet in both directions (no event, ack, or relayed API call; keepalives excluded) for this long. 0 disables broker-driven suspend")
 	)
 	pflag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
-
-	minter, err := newCertMinterFromFiles(*caCertFile, *caKeyFile)
-	if err != nil {
-		log.Error("egress-broker: loading broker CA", slog.Any("err", err))
-		os.Exit(1)
-	}
 
 	api, err := dialControl(*ateapiAddr)
 	if err != nil {
@@ -77,28 +67,32 @@ func main() {
 	control := newControlClient(api, *bootOnResume)
 
 	realSlack := newRealSlackDialer(*dnsUpstream, *slackAPIBase)
-	reg := NewRegistry(control, control, realSlack, *deliverDelay, *idleGrace, log)
-	srv := NewServer(reg, control, realSlack, *wssHost, *wssPath, log)
+	reg := NewRegistry(control, control, realSlack, *idleGrace, log)
 
-	httpServer := &http.Server{
-		Addr:      *listenAddr,
-		Handler:   srv,
-		TLSConfig: minter.TLSConfig(),
+	ln, err := net.Listen("tcp", *grpcListen)
+	if err != nil {
+		log.Error("egress-broker: listen", slog.String("addr", *grpcListen), slog.Any("err", err))
+		os.Exit(1)
 	}
+	// Proxies ping every 10s so a broker restart is noticed quickly; permit
+	// that even on a quiet stream.
+	srv := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+	}))
+	brokerproxypb.RegisterBrokerProxyServer(srv, NewGRPCServer(reg, realSlack, log))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		log.Info("egress-broker: shutting down")
-		_ = httpServer.Close()
+		srv.GracefulStop()
 	}()
 
-	log.Info("egress-broker: broker listening", slog.String("addr", *listenAddr), slog.String("wss_host", *wssHost))
-	// Cert and key are provided by the minter's GetCertificate, so the file
-	// arguments are empty.
-	if err := httpServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("egress-broker: broker server exited", slog.Any("err", err))
+	log.Info("egress-broker: serving proxy sessions", slog.String("addr", *grpcListen))
+	if err := srv.Serve(ln); err != nil {
+		log.Error("egress-broker: serve exited", slog.Any("err", err))
 		os.Exit(1)
 	}
 }
