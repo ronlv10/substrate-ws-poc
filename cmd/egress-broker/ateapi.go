@@ -42,6 +42,16 @@ type Resumer interface {
 	Resume(ctx context.Context, ref ActorRef) error
 }
 
+// Suspender checkpoints a running actor from the OUTSIDE. The broker drives
+// suspend (rather than the actor suspending itself) because a self-suspend is a
+// checkpoint taken mid-call: with onPause=Data the actor's own process is not
+// preserved, so it kills itself mid-SuspendActor and the checkpoint is canceled
+// (the actor jams in SUSPENDING). An external caller is not part of the
+// checkpoint, so it completes cleanly — exactly like the platform's golden snapshot.
+type Suspender interface {
+	Suspend(ctx context.Context, ref ActorRef) error
+}
+
 // Locator resolves the actor that owns a given worker-pod source IP. Actor
 // egress is SNAT'd behind the worker pod IP, so the broker sees that IP as the
 // connection's remote address and maps it back to an actor identity.
@@ -97,6 +107,16 @@ func (c *controlClient) Resume(ctx context.Context, ref ActorRef) error {
 	case res := <-ch:
 		return res.Err
 	}
+}
+
+// Suspend checkpoints the actor from outside. A nil error means the checkpoint
+// was accepted; the actor's broker-facing WebSocket then dies as it freezes,
+// which the session observes as a Detach.
+func (c *controlClient) Suspend(ctx context.Context, ref ActorRef) error {
+	_, err := c.api.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+		ActorRef: &ateapipb.ActorRef{Atespace: ref.Atespace, Name: ref.Name},
+	})
+	return err
 }
 
 // LocateByPodIP scans actors (optionally page by page) for a RUNNING actor

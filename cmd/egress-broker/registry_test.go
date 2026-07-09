@@ -101,7 +101,7 @@ func discardLogger() *slog.Logger {
 }
 
 func newTestSession(resumer Resumer) *session {
-	reg := NewRegistry(resumer, nil, 0, discardLogger())
+	reg := NewRegistry(resumer, nil, nil, 0, 0, discardLogger())
 	return &session{ref: ActorRef{Atespace: "demo", Name: "echo-1"}, reg: reg}
 }
 
@@ -273,7 +273,7 @@ func TestEventWhileAttachedDeliversWithoutResume(t *testing.T) {
 
 // Registry keys sessions per actor.
 func TestRegistryGetOrCreateIsPerActor(t *testing.T) {
-	reg := NewRegistry(&fakeResumer{}, nil, 0, discardLogger())
+	reg := NewRegistry(&fakeResumer{}, nil, nil, 0, 0, discardLogger())
 	a1 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
 	a1b := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
 	a2 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-2"})

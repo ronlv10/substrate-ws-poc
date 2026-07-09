@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/spf13/pflag"
@@ -55,6 +56,7 @@ func main() {
 		ateapiAddr   = pflag.String("ateapi-address", "api.ate-system.svc:443", "Substrate Control API (ateapi) address")
 		bootOnResume = pflag.Bool("boot-on-resume", false, "Boot actors fresh on resume instead of restoring the checkpoint")
 		deliverDelay = pflag.Duration("deliver-delay", 0, "Fallback: deliver buffered events this long after (re)connect even if no heartbeat is seen. Normally delivery is triggered by the client's first heartbeat (its connected:ready signal). 0 = heartbeat-only")
+		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "Suspend an actor after its broker-facing connection is quiet in both directions (no event, ack, or forwarded API call; keepalive pings excluded) for this long. 0 disables broker-driven suspend")
 	)
 	pflag.Parse()
 
@@ -75,7 +77,7 @@ func main() {
 	control := newControlClient(api, *bootOnResume)
 
 	realSlack := newRealSlackDialer(*dnsUpstream, *slackAPIBase)
-	reg := NewRegistry(control, realSlack, *deliverDelay, log)
+	reg := NewRegistry(control, control, realSlack, *deliverDelay, *idleGrace, log)
 	srv := NewServer(reg, control, realSlack, *wssHost, *wssPath, log)
 
 	httpServer := &http.Server{

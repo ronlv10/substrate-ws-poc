@@ -39,6 +39,11 @@ import (
 // deadline (see echo-actor).
 const actorPingInterval = 5 * time.Second
 
+// goldenAtespace is the atespace substrate places golden-snapshot template actors
+// in. Connections identified as belonging to it are served the Socket Mode
+// handshake but never get a persistent Slack session (see handleConnectionsOpen).
+const goldenAtespace = "ate-golden"
+
 // Server terminates the actor's TLS to Slack. It synthesizes
 // apps.connections.open (pointing the actor's Socket Mode WebSocket back at the
 // broker), captures the app-level token, serves the actor-facing Socket Mode
@@ -107,16 +112,48 @@ func (s *Server) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := remoteIP(r.RemoteAddr)
-	// Resolve which actor is calling, retrying briefly: right after a resume the
-	// actor is RUNNING but ListActors (Redis) can lag by a moment. Returning an
-	// error here makes sophisticated clients (Bolt) tear down and reconnect with
-	// backoff, churning for many seconds and redelivering events they then
-	// dedupe-drop. Waiting a beat lets the actor connect cleanly on the first try.
-	ref, err := s.locateWithRetry(r.Context(), ip)
-	if err != nil {
-		s.log.Warn("egress-broker: could not identify actor for apps.connections.open",
-			slog.String("src_ip", ip), slog.Any("err", err))
-		writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: false, Error: "ws-poc_actor_not_identified"})
+
+	// Identify which actor is calling. Preferred: the actor announces its own
+	// substrate identity in the X-Ate-Actor header (deterministic, no races). We
+	// fall back to source-IP correlation only if the header is absent — but that
+	// path is inherently flaky, because it matches the connection's source IP
+	// against the control plane's eventually-consistent AteomPodIp, which lags
+	// right after a boot/resume and makes identification fail.
+	var (
+		ref    ActorRef
+		via    string
+		hadRef bool
+	)
+	if h := strings.TrimSpace(r.Header.Get("X-Ate-Actor")); h != "" {
+		if parsed, ok := parseActorRef(h); ok {
+			ref, hadRef, via = parsed, true, "header"
+		} else {
+			s.log.Warn("egress-broker: ignoring malformed X-Ate-Actor header", slog.String("value", h))
+		}
+	}
+	if !hadRef {
+		located, err := s.locateWithRetry(r.Context(), ip)
+		if err != nil {
+			s.log.Warn("egress-broker: could not identify actor for apps.connections.open",
+				slog.String("src_ip", ip), slog.Any("err", err))
+			writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: false, Error: "ws-poc_actor_not_identified"})
+			return
+		}
+		ref, via = located, "source-ip"
+	}
+
+	// The golden-snapshot template actor (atespace "ate-golden") is ephemeral: it
+	// runs only to warm a snapshot the real actor is cloned from. Serve its Socket
+	// Mode handshake so it reaches connected:ready and can be checkpointed, but do
+	// NOT open a persistent Slack connection under the golden identity — that
+	// connection would sit on the app token and intercept events meant for the
+	// real actor. Only real actors get a Slack session.
+	if ref.Atespace == goldenAtespace {
+		ticket := s.issueTicket(ref)
+		wssURL := (&url.URL{Scheme: "wss", Host: s.wssHost, Path: s.wssPath, RawQuery: "ticket=" + ticket}).String()
+		s.log.Info("egress-broker: golden template actor opened Socket Mode connection (no Slack session)",
+			slog.String("actor", ref.String()), slog.String("identified_via", via))
+		writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: true, URL: wssURL})
 		return
 	}
 
@@ -125,7 +162,7 @@ func (s *Server) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 	ticket := s.issueTicket(ref)
 	wssURL := (&url.URL{Scheme: "wss", Host: s.wssHost, Path: s.wssPath, RawQuery: "ticket=" + ticket}).String()
 	s.log.Info("egress-broker: actor opened Socket Mode connection",
-		slog.String("actor", ref.String()), slog.String("src_ip", ip))
+		slog.String("actor", ref.String()), slog.String("src_ip", ip), slog.String("identified_via", via))
 	writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: true, URL: wssURL})
 }
 
@@ -241,6 +278,19 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	copyHeader(outReq.Header, r.Header)
 	outReq.Header.Del("Accept-Encoding") // let Go negotiate; avoids double-encoding
 
+	// If this call carries an actor identity (our actor sends X-Ate-Actor on every
+	// slack.com request, chat.postMessage included), hold off that actor's idle
+	// suspend until the forward finishes — chat.postMessage can be slow/retried,
+	// and suspending mid-send would drop the reply.
+	if h := strings.TrimSpace(r.Header.Get("X-Ate-Actor")); h != "" {
+		if ref, ok := parseActorRef(h); ok {
+			if sess := s.reg.Lookup(ref); sess != nil {
+				sess.beginForward()
+				defer sess.endForward()
+			}
+		}
+	}
+
 	resp, err := s.forward.httpClient.Do(outReq)
 	if err != nil {
 		s.log.Warn("egress-broker: forwarding to Slack failed", slog.String("path", r.URL.Path), slog.Any("err", err))
@@ -266,6 +316,21 @@ func (s *Server) issueTicket(ref ActorRef) string {
 	s.tickets[t] = ticketEntry{ref: ref, expires: time.Now().Add(2 * time.Minute)}
 	s.ticketsMu.Unlock()
 	return t
+}
+
+// parseActorRef parses an "<atespace>/<name>" identity string (as sent in the
+// X-Ate-Actor header) into an ActorRef. Both parts must be non-empty and name
+// must not itself contain a slash.
+func parseActorRef(v string) (ActorRef, bool) {
+	i := strings.IndexByte(v, '/')
+	if i <= 0 || i >= len(v)-1 {
+		return ActorRef{}, false
+	}
+	atespace, name := v[:i], v[i+1:]
+	if strings.ContainsRune(name, '/') {
+		return ActorRef{}, false
+	}
+	return ActorRef{Atespace: atespace, Name: name}, true
 }
 
 func (s *Server) redeemTicket(t string) (ActorRef, bool) {

@@ -50,9 +50,10 @@ func mustJSON(v any) []byte {
 // ActorRef — so each Slack connection maps to exactly one actor and inbound
 // events route unambiguously.
 type Registry struct {
-	resumer Resumer
-	dialer  SlackDialer
-	log     *slog.Logger
+	resumer   Resumer
+	suspender Suspender
+	dialer    SlackDialer
+	log       *slog.Logger
 
 	// deliverDelay holds buffered events for this long after an actor
 	// (re)connects before delivering them, giving a client that reconnects with
@@ -61,19 +62,27 @@ type Registry struct {
 	// immediately.
 	deliverDelay time.Duration
 
+	// idleGrace is how long the actor's broker-facing connection may be quiet in
+	// both directions (no delivered event, no ack, no forwarded API call;
+	// keepalive pings excluded) before the broker suspends it. Zero disables
+	// broker-driven suspend.
+	idleGrace time.Duration
+
 	mu       sync.Mutex
 	sessions map[ActorRef]*session
 }
 
 // NewRegistry builds a Registry.
-func NewRegistry(resumer Resumer, dialer SlackDialer, deliverDelay time.Duration, log *slog.Logger) *Registry {
+func NewRegistry(resumer Resumer, suspender Suspender, dialer SlackDialer, deliverDelay, idleGrace time.Duration, log *slog.Logger) *Registry {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Registry{
 		resumer:      resumer,
+		suspender:    suspender,
 		dialer:       dialer,
 		deliverDelay: deliverDelay,
+		idleGrace:    idleGrace,
 		log:          log,
 		sessions:     make(map[ActorRef]*session),
 	}
@@ -89,6 +98,15 @@ func (r *Registry) GetOrCreate(ref ActorRef) *session {
 		r.sessions[ref] = s
 	}
 	return s
+}
+
+// Lookup returns the existing session for ref, or nil if none exists (unlike
+// GetOrCreate it never creates one — used by the passthrough to touch a session
+// only if the actor is actually connected).
+func (r *Registry) Lookup(ref ActorRef) *session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessions[ref]
 }
 
 // session coordinates one actor's Slack connection and message delivery.
@@ -110,8 +128,84 @@ type session struct {
 	settled    bool              // true once the post-attach settle delay has elapsed
 	deliverTmr *time.Timer       // fires when the connection is considered settled
 
+	// Broker-driven idle suspend. idleTmr fires idleGrace after the last activity
+	// (delivery, ack, or forwarded API call) and suspends the actor from outside.
+	// inFlight counts outstanding actor->Slack forwards (chat.postMessage) so we
+	// never suspend mid-send; suspending guards against a double suspend.
+	idleTmr    *time.Timer
+	inFlight   int
+	suspending bool
+
 	// sinkWrite serializes writes to sink (gorilla permits one writer at a time).
 	sinkWrite sync.Mutex
+}
+
+// noteActivity resets the idle-suspend timer. Called on every real actor<->broker
+// exchange (event delivered, ack received, API call forwarded) — but NOT on
+// keepalive pings, so a quiet-but-connected actor still ages out and suspends.
+func (s *session) noteActivity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.armIdleLocked()
+}
+
+// armIdleLocked (re)arms the idle timer unless the actor is disconnected, a
+// suspend is already in flight, a forward is in flight, or idle suspend is off.
+// Caller holds mu.
+func (s *session) armIdleLocked() {
+	if s.idleTmr != nil {
+		s.idleTmr.Stop()
+		s.idleTmr = nil
+	}
+	if s.sink == nil || s.suspending || s.inFlight > 0 || s.reg.idleGrace <= 0 {
+		return
+	}
+	s.idleTmr = time.AfterFunc(s.reg.idleGrace, s.onIdle)
+}
+
+// onIdle suspends the actor after idleGrace of no activity, from the OUTSIDE.
+func (s *session) onIdle() {
+	s.mu.Lock()
+	if s.sink == nil || s.suspending || s.inFlight > 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.suspending = true
+	ref := s.ref
+	s.mu.Unlock()
+
+	s.reg.log.Info("egress-broker: actor idle; suspending from broker",
+		slog.String("actor", ref.String()), slog.Duration("idle", s.reg.idleGrace))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.reg.suspender.Suspend(ctx, ref); err != nil {
+		s.reg.log.Warn("egress-broker: suspending actor failed; will retry after next idle",
+			slog.String("actor", ref.String()), slog.Any("err", err))
+		s.mu.Lock()
+		s.suspending = false
+		s.armIdleLocked()
+		s.mu.Unlock()
+	}
+}
+
+// beginForward marks an actor->Slack forward in progress (chat.postMessage), so
+// idle suspend holds off until it completes. endForward re-arms.
+func (s *session) beginForward() {
+	s.mu.Lock()
+	s.inFlight++
+	if s.idleTmr != nil {
+		s.idleTmr.Stop()
+		s.idleTmr = nil
+	}
+	s.mu.Unlock()
+}
+func (s *session) endForward() {
+	s.mu.Lock()
+	if s.inFlight > 0 {
+		s.inFlight--
+	}
+	s.armIdleLocked()
+	s.mu.Unlock()
 }
 
 // pendingEvent is a Slack event held until the actor acknowledges it. It is kept
@@ -254,6 +348,7 @@ func (s *session) onEvent(raw []byte) {
 	case frames != nil:
 		// Actor is connected and settled: deliver this new event now.
 		s.writeToSink(sink, frames)
+		s.noteActivity()
 	case sink != nil:
 		// Connected but still within the post-attach settle window: leave it
 		// buffered; the settle timer will deliver it.
@@ -337,6 +432,7 @@ func (s *session) Ack(actorEnvelopeID string) {
 			delete(s.freshIDs, fid)
 		}
 	}
+	s.armIdleLocked() // an ack is real actor->broker activity
 }
 
 // randID returns a short random hex id for actor-facing envelope ids.
@@ -454,17 +550,29 @@ func (s *session) deliverBufferedNow(sink actorSink, trigger string) {
 			slog.String("actor", s.ref.String()), slog.Int("count", len(frames)), slog.String("trigger", trigger))
 	}
 	s.writeToSink(sink, frames)
+	// Attaching/delivering is activity: start the idle countdown. A bootstrap
+	// connection with nothing buffered lands here too, so an actor that just
+	// opened its Slack connection with no work also ages out and gets suspended.
+	s.noteActivity()
 }
 
-// Detach clears the actor connection if it is still the current one.
+// Detach clears the actor connection if it is still the current one. Also fires
+// when the broker suspends the actor and the checkpoint tears down its socket, so
+// it resets the idle-suspend state.
 func (s *session) Detach(sink actorSink) {
 	s.mu.Lock()
 	if s.sink == sink {
 		s.sink = nil
 		s.settled = false
+		s.suspending = false
+		s.inFlight = 0
 		if s.deliverTmr != nil {
 			s.deliverTmr.Stop()
 			s.deliverTmr = nil
+		}
+		if s.idleTmr != nil {
+			s.idleTmr.Stop()
+			s.idleTmr = nil
 		}
 	}
 	s.mu.Unlock()

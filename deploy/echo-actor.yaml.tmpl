@@ -107,10 +107,26 @@ spec:
       httpGet:
         path: /readyz
         port: 80
+    volumeMounts:
+    # A durable-dir volume so onPause=Data has something to snapshot (the DATA
+    # snapshot requires at least one durable-dir volume). The echo actor writes
+    # nothing here — it exists only to satisfy the Data-snapshot path.
+    - name: data
+      mountPath: /data
   workerSelector:
     matchLabels:
       workload: ws-poc-echo
+  # onPause: Data snapshots only the durable-dir volume, NOT the process memory —
+  # so every resume COLD-BOOTS the actor from the image instead of warm-restoring
+  # a frozen process. Deliberate: warm-restoring the Bolt Socket Mode client
+  # resumes its dead external socket and churns through a primary/secondary
+  # reconnect that silently drops the delivered event. A fresh cold boot starts
+  # Bolt on one clean connection and dispatches reliably. The actor is stateless,
+  # so losing the process memory costs nothing.
   snapshotsConfig:
-    onPause: Full
-    onCommit: Full
+    onPause: Data
+    onCommit: Data
     location: gs://${BUCKET_NAME}/ate-demo-ws-poc/
+  volumes:
+  - name: data
+    durableDir: {}
