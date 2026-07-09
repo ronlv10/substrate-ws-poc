@@ -260,7 +260,8 @@ func TestReadyzRequiresQuiescence(t *testing.T) {
 	}
 	waitForQ(true)
 
-	// An in-flight egress blocks readiness until it resolves.
+	// An in-flight egress must NOT block readiness: a client retry loop would
+	// hold readyz hostage and deadlock golden-snapshot creation.
 	release := make(chan struct{})
 	core.SetEgress(func(string, string, http.Header, []byte) (*EgressResult, error) {
 		<-release
@@ -268,8 +269,8 @@ func TestReadyzRequiresQuiescence(t *testing.T) {
 	})
 	done := make(chan struct{})
 	go func() { core.Egress("POST", "/api/auth.test", nil, nil); close(done) }()
-	waitForQ(false)
+	time.Sleep(50 * time.Millisecond)
+	waitForQ(true)
 	close(release)
 	<-done
-	waitForQ(true)
 }

@@ -98,17 +98,20 @@ func (c *Core) AppToken() string {
 	return c.appToken
 }
 
-// AgentQuiescent reports whether the agent is attached, has heartbeated on
-// the current connection, and has no Web API call in flight; it drives
-// /readyz. Readiness gates two checkpoints: ResumeActor's wait (so delivery
-// only proceeds once the local reconnect churn has settled) and the golden
-// snapshot (substrate checkpoints as soon as readyz is green). A Node process
-// frozen while non-quiescent — mid-V8-startup or mid-HTTP-request — has been
-// observed to SIGILL on restore, so readiness means "safe to checkpoint".
+// AgentQuiescent reports whether the agent is attached and has heartbeated on
+// the current connection; it drives /readyz. Readiness gates two checkpoints:
+// ResumeActor's wait (so delivery only proceeds once the local reconnect
+// churn has settled) and the golden snapshot (substrate checkpoints as soon
+// as readyz is green). A Node process frozen mid-V8-startup SIGILLs on
+// restore; the first heartbeat only happens well past that. In-flight Web API
+// calls deliberately do NOT block readiness: a retrying client would hold
+// readiness hostage forever (observed with an unreachable broker), and the
+// golden-creation controller suspends on readyz timeouts, making the
+// dependency circular.
 func (c *Core) AgentQuiescent() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.agent != nil && c.ready && c.egressInFlight == 0
+	return c.agent != nil && c.ready
 }
 
 // LastContiguousAcked is the resume point for the broker Announce: every
