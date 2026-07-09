@@ -61,9 +61,6 @@ spec:
         - --wss-path=/ws-poc/socketmode
         - --dns-upstream=8.8.8.8:53
         - --ateapi-address=api.ate-system.svc:443
-        # Wake actors by booting fresh from the image on resume (kept from the
-        # CPython experiment; harmless for the Node actor, which also restores).
-        - --boot-on-resume=true
         # Buffered events are delivered on the client's first heartbeat (its
         # connected:ready signal) — no timer needed. --deliver-delay can arm a
         # fallback for clients that never heartbeat, but Bolt always does.

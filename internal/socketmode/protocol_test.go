@@ -48,11 +48,11 @@ func TestDecodeEnvelopeClassification(t *testing.T) {
 			wantEnvelopeID: "env-1",
 		},
 		{
-			name:           "slash_commands is a real event",
+			name:           "slash_commands is not forwarded (broker echoes messages only)",
 			raw:            `{"type":"slash_commands","envelope_id":"env-2"}`,
-			wantType:       TypeSlashCommands,
+			wantType:       "slash_commands",
 			wantConnMgmt:   false,
-			wantEvent:      true,
+			wantEvent:      false,
 			wantEnvelopeID: "env-2",
 		},
 	}
@@ -73,62 +73,6 @@ func TestDecodeEnvelopeClassification(t *testing.T) {
 			}
 			if env.EnvelopeID != tc.wantEnvelopeID {
 				t.Errorf("EnvelopeID = %q, want %q", env.EnvelopeID, tc.wantEnvelopeID)
-			}
-		})
-	}
-}
-
-func TestParseEventCallbackMessage(t *testing.T) {
-	raw := `{
-		"type":"events_api",
-		"envelope_id":"env-42",
-		"payload":{
-			"type":"event_callback",
-			"team_id":"T123",
-			"event":{"type":"message","channel":"C999","user":"U777","text":"hello world","ts":"1700000000.000100"}
-		}
-	}`
-	env, err := DecodeEnvelope([]byte(raw))
-	if err != nil {
-		t.Fatalf("DecodeEnvelope() error = %v", err)
-	}
-	cb, err := env.ParseEventCallback()
-	if err != nil {
-		t.Fatalf("ParseEventCallback() error = %v", err)
-	}
-	if cb.Event.Channel != "C999" || cb.Event.Text != "hello world" {
-		t.Errorf("event = %+v, want channel C999 text 'hello world'", cb.Event)
-	}
-	if !cb.Event.IsHumanMessage() {
-		t.Errorf("IsHumanMessage() = false, want true for a plain user message")
-	}
-}
-
-func TestParseEventCallbackWrongType(t *testing.T) {
-	env := Envelope{Type: TypeHello}
-	if _, err := env.ParseEventCallback(); err == nil {
-		t.Fatal("ParseEventCallback() on a hello envelope: want error, got nil")
-	}
-}
-
-func TestIsHumanMessageFiltersNonHuman(t *testing.T) {
-	tests := []struct {
-		name string
-		ev   MessageEvent
-		want bool
-	}{
-		{"plain user message", MessageEvent{Type: "message", Channel: "C1", User: "U1", Text: "hi"}, true},
-		{"app mention", MessageEvent{Type: "app_mention", Channel: "C1", User: "U1", Text: "<@B> hi"}, true},
-		{"bot message subtype", MessageEvent{Type: "message", Subtype: "bot_message", Channel: "C1", Text: "echo: hi"}, false},
-		{"bot id set (our own echo)", MessageEvent{Type: "message", BotID: "B1", Channel: "C1", Text: "echo: hi"}, false},
-		{"message edit", MessageEvent{Type: "message", Subtype: "message_changed", Channel: "C1", User: "U1"}, false},
-		{"non-message event", MessageEvent{Type: "reaction_added", Channel: "C1", User: "U1"}, false},
-		{"missing user", MessageEvent{Type: "message", Channel: "C1", Text: "hi"}, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.ev.IsHumanMessage(); got != tc.want {
-				t.Errorf("IsHumanMessage() = %v, want %v", got, tc.want)
 			}
 		})
 	}

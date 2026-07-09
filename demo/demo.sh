@@ -42,7 +42,7 @@ echo "${BOLD}  1) The actor is a stock Slack bot — proof from its source${RESE
 echo
 echo "     modules it imports:"
 grep -nE 'require\(' "$REPO/echo-actor/app.js" | sed -E 's/^/       /'
-lc=$(grep -cE 'child_process|execFile|spawn|SuspendActor|ResumeActor|/suspend-self|CheckpointWorkload|ateapi|@grpc|grpc' "$REPO/echo-actor/app.js" 2>/dev/null || echo 0)
+lc=$(grep -cE 'child_process|execFile|spawn|SuspendActor|ResumeActor|CheckpointWorkload|ateapi|@grpc|grpc' "$REPO/echo-actor/app.js" 2>/dev/null || echo 0)
 echo
 echo "     lifecycle/exec/gRPC calls in the actor:  ${BOLD}${GRN}${lc} matches${RESET}"
 echo "     ${DIM}→ no child_process, no gRPC, no SuspendActor/ResumeActor. It CANNOT${RESET}"

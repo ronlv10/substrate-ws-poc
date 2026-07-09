@@ -14,8 +14,8 @@ broker, which terminates TLS with a certificate the actor trusts and holds the
 real Slack socket itself. While the actor is suspended the broker keeps the
 Slack connection open and filters keepalive frames. When a real message
 arrives, the broker resumes the actor, the actor reconnects, and the broker
-delivers the buffered message. The actor replies `echo: <message>` and suspends
-itself again.
+delivers the buffered message. The actor replies `echo: <message>`, and once it
+goes idle the broker suspends it again.
 
 This is a concrete first step toward the "AgentGateway" egress phase already
 flagged in the codebase (`cmd/ateom-gvisor/main.go` — "the later AgentGateway
@@ -31,9 +31,8 @@ phase should replace the broad masquerade path with transparent TCP capture").
 - Therefore the durable Slack connection must live **outside** the actor. The
   broker owns it; the actor's connection to the broker is ephemeral and
   re-established on each resume.
-- `Control.ResumeActor` blocks until the actor's `/readyz` returns 200
-  (`internal/readyz`), so "resume, then the actor reconnects and we deliver" is
-  race-free by construction.
+- `Control.ResumeActor` blocks until the actor's `/readyz` returns 200, so
+  "resume, then the actor reconnects and we deliver" is race-free by construction.
 - All actor↔broker traffic is actor-initiated **egress**, so the broker never
   needs the inbound atenet router or the actor's pod IP to deliver a message.
 
@@ -48,7 +47,7 @@ phase should replace the broad masquerade path with transparent TCP capture").
    terminates TLS with a per-SNI cert the actor trusts        │
         ECHO ACTOR  <===== wss + HTTPS (MITM'd) =====>  BROKER
         (Socket Mode client + /readyz;                       forwards chat.postMessage → real Slack
-         self-suspends when idle)                            captures xapp-/xoxb- tokens from traffic
+         broker suspends it when idle)                       captures the xapp- app token from traffic
 ```
 
 Two live connections, bridged by the broker:
@@ -62,14 +61,15 @@ Two live connections, bridged by the broker:
   re-establishes it on resume.
 
 State is keyed **per actor** (`atespace/name`), so each Slack connection maps to
-exactly one actor and inbound events route unambiguously. The broker identifies
-which actor a connection belongs to from its source IP (actor egress is SNAT'd
-behind the worker pod IP; `Actor.AteomPodIp` from the Control API maps it back).
+exactly one actor and inbound events route unambiguously. The actor announces its
+own identity in an `X-Ate-Actor` header (read fresh from its per-resume `/run/ate`
+mount); the broker falls back to source-IP correlation (`Actor.AteomPodIp` from
+the Control API) only when the header is absent.
 
 ### Message lifecycle
 
 1. First run: the actor connects, the broker captures the app token and opens
-   the persistent Slack connection; the actor goes idle and self-suspends.
+   the persistent Slack connection; the actor goes idle and the broker suspends it.
 2. A user posts in Slack → the broker's Slack connection receives an
    `events_api` envelope.
 3. The broker acks Slack immediately (within the ~3s window, so Slack does not
@@ -78,8 +78,9 @@ behind the worker pod IP; `Actor.AteomPodIp` from the Control API maps it back).
    reconnects (its old socket died on restore).
 5. The broker attaches the reconnected actor, sends `hello`, and drains the
    buffered event(s).
-6. The actor replies `echo: <text>` via `chat.postMessage` (MITM'd through the
-   broker to real Slack) and, after an idle grace period, self-suspends again.
+6. The actor replies `echo: <text>` via `chat.postMessage` (forwarded through the
+   broker to real Slack). After an idle grace period, the broker suspends it again
+   from the outside.
 
 Slack `hello` / `disconnect` frames and WebSocket ping/pong are **never**
 delivered and never wake the actor.
@@ -89,10 +90,9 @@ delivered and never wake the actor.
 | Path | What it is |
 |------|------------|
 | `cmd/egress-broker/` | The egress broker: per-SNI TLS minting, Slack HTTPS handling (synthesize `apps.connections.open`, capture tokens, forward the rest), persistent Socket Mode client to Slack, Socket Mode server facing the actor, per-actor event buffer, and the `ResumeActor` client. |
-| `cmd/suspend-helper/` | Tiny Go binary bundled into the actor image; asks the control plane to checkpoint the actor (self-suspend). |
-| `echo-actor/` | A normal Slack Bolt (Node) bot that echoes messages, exposes `/readyz`, and self-suspends when idle. It has no knowledge of the broker. |
-| `internal/socketmode/` | The small Socket Mode envelope protocol (shared by broker and actor). |
-| `internal/slackapi/` | The slice of the Slack Web API used (`apps.connections.open`, `chat.postMessage`). |
+| `echo-actor/` | A normal Slack Bolt (Node) bot that echoes messages and exposes `/readyz`. It has no knowledge of the broker or of its own suspend/resume. |
+| `internal/socketmode/` | The small Socket Mode envelope types the broker uses. |
+| `internal/slackapi/` | The Slack Web API shape the broker synthesizes (`apps.connections.open`). |
 | `deploy/` | Broker Deployment/Service, CA installer DaemonSet, echo-actor WorkerPool/ActorTemplate, CoreDNS rewrite. |
 | `certs/` | Broker CA generation. |
 
@@ -124,8 +124,8 @@ opt-in (`cmd/atelet/oci.go`, `cmd/atelet/main.go`):
   CA bundle read-only over the actor's system CA store (inert when unset), so
   actors trust the broker's CA;
 - atelet also writes the actor's atespace into the per-resume identity mount
-  (`/run/ate/atespace`) so an actor can address itself to the control plane
-  (e.g. self-suspend).
+  (`/run/ate/atespace`) so an actor can read its own identity — the echo actor
+  sends it to the broker as the `X-Ate-Actor` header.
 
 Everything else uses the existing Control API. Build the cluster from that fork
 branch so the atelet image includes these changes.
@@ -189,7 +189,7 @@ make create-actor
 ## Tests
 
 ```bash
-make test        # go test ./poc/...
+make test        # go test ./...
 ```
 
 Unit tests cover per-SNI certificate minting (leaves verify against the CA),

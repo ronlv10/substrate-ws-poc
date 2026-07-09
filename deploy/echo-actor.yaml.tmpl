@@ -97,8 +97,6 @@ spec:
         secretKeyRef:
           name: slack-tokens
           key: bot-token
-    - name: ATE_API_ADDR
-      value: "api.ate-system.svc.cluster.local:443"
     # Make Node trust the broker CA that atelet mounts over the system bundle.
     # Node ignores SSL_CERT_FILE; it honors NODE_EXTRA_CA_CERTS (adds to its roots).
     - name: NODE_EXTRA_CA_CERTS

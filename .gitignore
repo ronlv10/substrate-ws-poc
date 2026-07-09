@@ -1,8 +1,6 @@
 # Generated broker CA material (never commit private keys)
 certs/ca.crt
 certs/ca.key
-# Prebuilt Go suspend helper (cross-compiled into the actor image build context)
-echo-actor/suspend-self
 # Node build artifacts
 echo-actor/node_modules/
 echo-actor/dist/

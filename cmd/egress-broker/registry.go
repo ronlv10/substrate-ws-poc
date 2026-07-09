@@ -299,14 +299,10 @@ func (s *session) readSlackUntilClose(conn SlackConn, stop <-chan struct{}) {
 
 		switch {
 		case env.IsConnectionManagement():
-			// hello / disconnect: keepalive/lifecycle traffic. Never wake the
-			// actor. A disconnect asks us to reconnect, which the caller does by
-			// returning; hello is informational.
+			// hello / disconnect: lifecycle traffic that must never wake the
+			// actor. slack-go reconnects on its own, so just drop it.
 			s.reg.log.Debug("egress-broker: ignoring Slack connection-management frame",
 				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
-			if env.Type == socketmode.TypeDisconnect {
-				return
-			}
 		case env.IsEvent():
 			// Ack to Slack immediately (within the ~3s window) so it is not
 			// redelivered, then buffer + deliver to the actor.

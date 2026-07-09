@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/agent-substrate/substrate v0.0.0-20260707172352-4f29aaf32116
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
+	github.com/slack-go/slack v0.27.0
 	github.com/spf13/pflag v1.0.10
 	golang.org/x/sync v0.21.0
 	google.golang.org/grpc v1.82.0

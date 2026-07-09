@@ -22,8 +22,8 @@ export KO_DOCKER_REPO
 CADIR ?= $(CURDIR)/certs
 BROKER_PKG := github.com/ronlv10/substrate-ws-poc/cmd/egress-broker
 
-# The Bolt (Node) echo actor is a Docker image (not ko-built). It bundles a
-# cross-compiled Go suspend helper. ACTOR_ARCH must match the cluster nodes.
+# The Bolt (Node) echo actor is a Docker image (not ko-built). ACTOR_ARCH must
+# match the cluster nodes.
 ECHO_IMAGE ?= localhost:5001/ws-poc-echo-actor
 ACTOR_ARCH ?= arm64
 
@@ -80,12 +80,9 @@ build:
 	ko build $(BROKER_PKG)
 	$(MAKE) build-actor-image
 
-# Cross-compile the suspend helper into the actor build context, then build and
-# push the Bolt (Node) actor image.
+# Build and push the Bolt (Node) actor image.
 .PHONY: build-actor-image
 build-actor-image:
-	GOOS=linux GOARCH=$(ACTOR_ARCH) CGO_ENABLED=0 \
-		go build -o echo-actor/suspend-self ./cmd/suspend-helper
 	docker build --platform linux/$(ACTOR_ARCH) -t $(ECHO_IMAGE):latest $(CURDIR)/echo-actor
 	docker push $(ECHO_IMAGE):latest
 

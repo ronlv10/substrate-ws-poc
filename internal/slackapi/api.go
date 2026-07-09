@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package slackapi models the small slice of the Slack Web API the WS-PoC PoC
-// touches: the Socket Mode bootstrap (apps.connections.open) and posting the
-// echo reply (chat.postMessage). These shapes are used both by the broker (to
-// synthesize / forward API calls it intercepts) and by the echo actor (to make
-// them).
+// Package slackapi holds the Slack Web API shapes the broker synthesizes for the
+// Socket Mode bootstrap (apps.connections.open) it intercepts, plus the well-known
+// host and paths it routes on.
 package slackapi
 
 // Well-known Slack hosts and paths. Actors reach these transparently: cluster
@@ -28,9 +26,6 @@ const (
 
 	// PathConnectionsOpen bootstraps a Socket Mode connection.
 	PathConnectionsOpen = "/api/apps.connections.open"
-
-	// PathChatPostMessage posts a message to a channel.
-	PathChatPostMessage = "/api/chat.postMessage"
 )
 
 // ConnectionsOpenResponse is the apps.connections.open response. The broker
@@ -40,22 +35,4 @@ type ConnectionsOpenResponse struct {
 	OK    bool   `json:"ok"`
 	URL   string `json:"url,omitempty"`
 	Error string `json:"error,omitempty"`
-}
-
-// ChatPostMessageRequest is the subset of chat.postMessage arguments the echo
-// actor sends. Slack accepts this as JSON or as form-encoded; the actor uses
-// JSON with a bot-token bearer credential.
-type ChatPostMessageRequest struct {
-	Channel  string `json:"channel"`
-	Text     string `json:"text"`
-	ThreadTS string `json:"thread_ts,omitempty"`
-}
-
-// ChatPostMessageResponse is the subset of the chat.postMessage response the
-// echo actor checks.
-type ChatPostMessageResponse struct {
-	OK      bool   `json:"ok"`
-	Channel string `json:"channel,omitempty"`
-	TS      string `json:"ts,omitempty"`
-	Error   string `json:"error,omitempty"`
 }
