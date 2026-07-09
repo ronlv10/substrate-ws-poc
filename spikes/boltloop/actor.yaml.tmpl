@@ -1,0 +1,53 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Bolt-over-loopback spike actor. Shares the ws-poc-spike WorkerPool deployed
+# by spikes/loopback/actor.yaml. The Slack tokens are fakes — the in-image
+# server impersonates Slack, nothing leaves the sandbox.
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: boltloop-spike
+  namespace: ate-demo-ws-poc
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: boltloop
+    image: ${SPIKE_IMAGE}
+    command: ["/server"]
+    env:
+    - name: SLACK_APP_TOKEN
+      value: "xapp-spike-fake"
+    - name: SLACK_BOT_TOKEN
+      value: "xoxb-spike-fake"
+    - name: NODE_EXTRA_CA_CERTS
+      value: "/certs/ca.crt"
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  workerSelector:
+    matchLabels:
+      workload: ws-poc-spike
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Full
+    location: gs://${BUCKET_NAME}/ate-demo-ws-poc/
+  volumes:
+  - name: data
+    durableDir: {}
