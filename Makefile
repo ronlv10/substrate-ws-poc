@@ -32,22 +32,17 @@ ACTOR_ARCH ?= arm64
 # substrate checkout and pass the pinned digest here.
 ATEOM_IMAGE ?=
 
-ATELET_CA_PATH := /var/lib/ateom-gvisor/ws-poc-ca-certificates.crt
-
 .PHONY: help
 help:
 	@echo "substrate-ws-poc targets:"
 	@echo "  test           - run the unit tests"
-	@echo "  gen-ca         - generate the broker CA (certs/ca.crt, certs/ca.key)"
-	@echo "  ca-secret      - create the egress-broker-ca TLS secret from certs/"
+	@echo "  gen-proto      - regenerate the broker<->proxy gRPC stubs"
 	@echo "  slack-secret   - create the slack-tokens secret (needs APP_TOKEN, BOT_TOKEN)"
 	@echo "  build          - ko build the broker + build the actor image"
-	@echo "  deploy-broker  - apply broker + ca-installer (ko apply)"
-	@echo "  atelet-ca      - point atelet at the actor CA bundle (ATE_ACTOR_CA_BUNDLE)"
-	@echo "  coredns-patch  - add the slack.com -> broker CoreDNS rewrite"
-	@echo "  deploy-actor   - apply the echo-actor WorkerPool + ActorTemplate (needs BUCKET_NAME, ATEOM_IMAGE)"
+	@echo "  deploy-broker  - apply the broker (ko apply)"
+	@echo "  deploy-actor   - apply the echo-actor WorkerPool + ActorTemplate (needs BUCKET_NAME, ATEOM_IMAGE; BROKER_ADDRESS optional)"
 	@echo "  create-actor   - create the demo atespace + actor echo-1"
-	@echo "  deploy         - ca-secret + deploy-broker + atelet-ca + coredns-patch"
+	@echo "  deploy         - deploy-broker"
 	@echo "  clean          - delete PoC resources"
 
 .PHONY: test
@@ -58,17 +53,6 @@ test:
 .PHONY: gen-proto
 gen-proto:
 	go run github.com/bufbuild/buf/cmd/buf@v1.50.0 generate
-
-.PHONY: gen-ca
-gen-ca:
-	cd $(CADIR) && OUT_DIR=. bash gen-ca.sh
-
-.PHONY: ca-secret
-ca-secret:
-	kubectl create namespace ws-poc --dry-run=client -o yaml | kubectl apply -f -
-	kubectl -n ws-poc create secret tls egress-broker-ca \
-		--cert=$(CADIR)/ca.crt --key=$(CADIR)/ca.key \
-		--dry-run=client -o yaml | kubectl apply -f -
 
 .PHONY: slack-secret
 slack-secret:
@@ -98,16 +82,6 @@ build-actor-image:
 .PHONY: deploy-broker
 deploy-broker:
 	ko apply -f deploy/egress-broker.yaml
-	kubectl apply -f deploy/ca-installer.yaml
-
-.PHONY: atelet-ca
-atelet-ca:
-	kubectl -n ate-system set env daemonset/atelet ATE_ACTOR_CA_BUNDLE=$(ATELET_CA_PATH)
-	kubectl -n ate-system rollout status daemonset/atelet --timeout=120s
-
-.PHONY: coredns-patch
-coredns-patch:
-	@bash $(CURDIR)/deploy/coredns-patch.sh
 
 # BROKER_ADDRESS empty deploys the proxy standalone (phase-1 loop); set it to
 # egress-broker.ws-poc.svc.cluster.local:9090 for the full path.
@@ -131,13 +105,11 @@ create-actor:
 	kubectl ate create actor echo-1 -a demo --template ate-demo-ws-poc/echo
 
 .PHONY: deploy
-deploy: ca-secret deploy-broker atelet-ca coredns-patch
-	@echo "Broker deployed. Now: make slack-secret APP_TOKEN=.. BOT_TOKEN=.. && make deploy-actor BUCKET_NAME=.. ATEOM_IMAGE=.. && make create-actor"
+deploy: deploy-broker
+	@echo "Broker deployed. Now: make slack-secret APP_TOKEN=.. BOT_TOKEN=.. && make deploy-actor BUCKET_NAME=.. ATEOM_IMAGE=.. BROKER_ADDRESS=egress-broker.ws-poc.svc.cluster.local:9090 && make create-actor"
 
 .PHONY: clean
 clean:
 	-kubectl ate delete actor echo-1 -a demo
-	-sed -e "s|\$${BUCKET_NAME}|placeholder|g" -e "s|\$${ECHO_IMAGE}|placeholder@sha256:0|g" -e "s|\$${ATEOM_IMAGE}|placeholder@sha256:0|g" deploy/echo-actor.yaml.tmpl | kubectl delete --ignore-not-found -f -
-	-kubectl delete --ignore-not-found -f deploy/ca-installer.yaml
+	-sed -e "s|\$${BUCKET_NAME}|placeholder|g" -e "s|\$${ECHO_IMAGE}|placeholder@sha256:0|g" -e "s|\$${ATEOM_IMAGE}|placeholder@sha256:0|g" -e "s|\$${BROKER_ADDRESS}||g" deploy/echo-actor.yaml.tmpl | kubectl delete --ignore-not-found -f -
 	-kubectl delete --ignore-not-found -f deploy/egress-broker.yaml
-	-kubectl -n ate-system set env daemonset/atelet ATE_ACTOR_CA_BUNDLE-

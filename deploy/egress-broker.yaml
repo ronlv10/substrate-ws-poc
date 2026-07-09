@@ -13,11 +13,10 @@
 # limitations under the License.
 #
 # The WS-PoC egress broker: an always-on service that owns the persistent
-# Slack Socket Mode connection on behalf of suspendable actors. Apply with
-# `ko apply -f` so the ko:// image reference is built and pinned.
-#
-# Prerequisite: the broker CA secret must exist (see certs/gen-ca.sh):
-#   kubectl -n ws-poc create secret tls egress-broker-ca --cert=ca.crt --key=ca.key
+# Slack Socket Mode connection on behalf of suspendable actors and serves the
+# gRPC Session protocol to each actor's local proxy. Apply with `ko apply -f`
+# so the ko:// image reference is built and pinned. No certs or DNS rewrites:
+# actor-facing TLS lives in the actor image's local proxy.
 
 apiVersion: v1
 kind: Namespace
@@ -56,27 +55,12 @@ spec:
       - name: broker
         image: ko://github.com/ronlv10/substrate-ws-poc/cmd/egress-broker
         args:
-        - --listen=:8443
-        - --wss-host=wss-primary.slack.com
-        - --wss-path=/ws-poc/socketmode
+        - --grpc-listen=:9090
         - --dns-upstream=8.8.8.8:53
         - --ateapi-address=api.ate-system.svc:443
-        # Buffered events are delivered on the client's first heartbeat (its
-        # connected:ready signal) — no timer needed. --deliver-delay can arm a
-        # fallback for clients that never heartbeat, but Bolt always does.
-        - --ca-cert=/etc/ws-poc/ca/tls.crt
-        - --ca-key=/etc/ws-poc/ca/tls.key
         ports:
-        - name: https
-          containerPort: 8443
-        volumeMounts:
-        - name: broker-ca
-          mountPath: /etc/ws-poc/ca
-          readOnly: true
-      volumes:
-      - name: broker-ca
-        secret:
-          secretName: egress-broker-ca
+        - name: grpc
+          containerPort: 9090
 
 ---
 
@@ -91,9 +75,6 @@ spec:
   selector:
     app: egress-broker
   ports:
-  # Actors dial slack.com:443 (and wss over 443); cluster DNS points those
-  # hostnames here, and this Service forwards 443 to the broker's 8443 so the
-  # broker need not run privileged.
-  - name: https
-    port: 443
-    targetPort: 8443
+  - name: grpc
+    port: 9090
+    targetPort: 9090
