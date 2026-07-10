@@ -1,17 +1,3 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
@@ -29,8 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/ronlv10/substrate-ws-poc/internal/slackapi"
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
 // actorPingInterval is how often the broker pings the actor's Socket Mode
@@ -44,6 +29,13 @@ const actorPingInterval = 5 * time.Second
 // handshake but never get a persistent Slack session (see handleConnectionsOpen).
 const goldenAtespace = "ate-golden"
 
+// wssHost / wssPath describe the Socket Mode WebSocket the broker synthesizes for
+// actors. wssHost is a Slack hostname the actor's /etc/hosts maps to the broker.
+const (
+	wssHost = "wss-primary.slack.com"
+	wssPath = "/ws-poc/socketmode"
+)
+
 // Server terminates the actor's TLS to Slack. It synthesizes
 // apps.connections.open (pointing the actor's Socket Mode WebSocket back at the
 // broker), captures the app-level token, serves the actor-facing Socket Mode
@@ -51,15 +43,9 @@ const goldenAtespace = "ate-golden"
 type Server struct {
 	reg      *Registry
 	locator  Locator
-	forward  *realSlackDialer // reused for its Slack-reaching HTTP client
+	forward  *slack.Dialer // reused for its Slack-reaching HTTP client (passthrough)
 	upgrader websocket.Upgrader
 	log      *slog.Logger
-
-	// wssHost is embedded in the synthesized wss URL. It must be a hostname the
-	// actor's DNS maps to the broker (e.g. "wss-primary.slack.com").
-	wssHost string
-	// wssPath is the path the actor's Socket Mode WebSocket connects to.
-	wssPath string
 
 	ticketsMu sync.Mutex
 	tickets   map[string]ticketEntry
@@ -71,7 +57,7 @@ type ticketEntry struct {
 }
 
 // NewServer builds the actor-facing broker HTTP handler.
-func NewServer(reg *Registry, locator Locator, forward *realSlackDialer, wssHost, wssPath string, log *slog.Logger) *Server {
+func NewServer(reg *Registry, locator Locator, forward *slack.Dialer, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -83,17 +69,15 @@ func NewServer(reg *Registry, locator Locator, forward *realSlackDialer, wssHost
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
 		log:     log,
-		wssHost: wssHost,
-		wssPath: wssPath,
 		tickets: make(map[string]ticketEntry),
 	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case r.URL.Path == s.wssPath:
+	case r.URL.Path == wssPath:
 		s.handleActorSocket(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == slackapi.PathConnectionsOpen:
+	case r.Method == http.MethodPost && r.URL.Path == slack.PathConnectionsOpen:
 		s.handleConnectionsOpen(w, r)
 	default:
 		s.handlePassthrough(w, r)
@@ -107,7 +91,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 	token := bearerToken(r.Header.Get("Authorization"))
 	if token == "" {
-		writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: false, Error: "not_authed"})
+		writeJSON(w, http.StatusOK, slack.ConnectionsOpenResponse{OK: false, Error: "not_authed"})
 		return
 	}
 
@@ -136,7 +120,7 @@ func (s *Server) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.log.Warn("egress-broker: could not identify actor for apps.connections.open",
 				slog.String("src_ip", ip), slog.Any("err", err))
-			writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: false, Error: "ws-poc_actor_not_identified"})
+			writeJSON(w, http.StatusOK, slack.ConnectionsOpenResponse{OK: false, Error: "ws-poc_actor_not_identified"})
 			return
 		}
 		ref, via = located, "source-ip"
@@ -150,20 +134,25 @@ func (s *Server) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 	// real actor. Only real actors get a Slack session.
 	if ref.Atespace == goldenAtespace {
 		ticket := s.issueTicket(ref)
-		wssURL := (&url.URL{Scheme: "wss", Host: s.wssHost, Path: s.wssPath, RawQuery: "ticket=" + ticket}).String()
 		s.log.Info("egress-broker: golden template actor opened Socket Mode connection (no Slack session)",
 			slog.String("actor", ref.String()), slog.String("identified_via", via))
-		writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: true, URL: wssURL})
+		writeJSON(w, http.StatusOK, slack.ConnectionsOpenResponse{OK: true, URL: wssURL(ticket)})
 		return
 	}
 
 	s.reg.GetOrCreate(ref).EnsureStarted(token)
 
 	ticket := s.issueTicket(ref)
-	wssURL := (&url.URL{Scheme: "wss", Host: s.wssHost, Path: s.wssPath, RawQuery: "ticket=" + ticket}).String()
 	s.log.Info("egress-broker: actor opened Socket Mode connection",
 		slog.String("actor", ref.String()), slog.String("src_ip", ip), slog.String("identified_via", via))
-	writeJSON(w, http.StatusOK, slackapi.ConnectionsOpenResponse{OK: true, URL: wssURL})
+	writeJSON(w, http.StatusOK, slack.ConnectionsOpenResponse{OK: true, URL: wssURL(ticket)})
+}
+
+// wssURL is the Socket Mode wss URL the broker hands the actor: it points back at
+// the broker (via wssHost, which the actor's /etc/hosts maps here) and carries the
+// one-time ticket the actor redeems on the WebSocket.
+func wssURL(ticket string) string {
+	return (&url.URL{Scheme: "wss", Host: wssHost, Path: wssPath, RawQuery: "ticket=" + ticket}).String()
 }
 
 // locateWithRetry resolves the actor for a source IP, retrying for a few
@@ -256,7 +245,7 @@ func (s *Server) handleActorSocket(w http.ResponseWriter, r *http.Request) {
 			s.log.Info("egress-broker: actor WebSocket closed", slog.String("actor", ref.String()), slog.Any("err", err))
 			return
 		}
-		if ack, derr := socketmode.DecodeEnvelope(data); derr == nil && ack.EnvelopeID != "" {
+		if ack, derr := slack.DecodeEnvelope(data); derr == nil && ack.EnvelopeID != "" {
 			sess.Ack(ack.EnvelopeID)
 		}
 	}
@@ -266,7 +255,7 @@ func (s *Server) handleActorSocket(w http.ResponseWriter, r *http.Request) {
 // to real Slack and relays the response. This keeps non-WS-PoC traffic (and
 // the echo actor's own reply) working under the cluster-wide DNS redirect.
 func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	target := s.forward.apiBaseURL + r.URL.Path
+	target := s.forward.APIBaseURL() + r.URL.Path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -291,7 +280,7 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, err := s.forward.httpClient.Do(outReq)
+	resp, err := s.forward.HTTPClient().Do(outReq)
 	if err != nil {
 		s.log.Warn("egress-broker: forwarding to Slack failed", slog.String("path", r.URL.Path), slog.Any("err", err))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -355,14 +344,6 @@ func (s *gorillaActorSink) WriteFrame(b []byte) error {
 	return s.conn.WriteMessage(websocket.TextMessage, b)
 }
 
-func bearerToken(authHeader string) string {
-	const prefix = "Bearer "
-	if len(authHeader) > len(prefix) && strings.EqualFold(authHeader[:len(prefix)], prefix) {
-		return strings.TrimSpace(authHeader[len(prefix):])
-	}
-	return ""
-}
-
 func remoteIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -375,6 +356,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func bearerToken(authHeader string) string {
+	const prefix = "Bearer "
+	if len(authHeader) > len(prefix) && strings.EqualFold(authHeader[:len(prefix)], prefix) {
+		return strings.TrimSpace(authHeader[len(prefix):])
+	}
+	return ""
 }
 
 func copyHeader(dst, src http.Header) {

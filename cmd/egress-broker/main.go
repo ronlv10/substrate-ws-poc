@@ -1,28 +1,13 @@
-// Copyright 2026 Google LLC
+// Command egress-broker is the egress broker: an always-on service that owns the
+// persistent realtime connection to a messaging provider (Slack today) on behalf
+// of suspendable substrate actors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Command egress-broker is the WebSocket egress broker: an always-on service
-// that owns the persistent Slack Socket Mode connection on behalf of suspendable
-// substrate actors.
-//
-// Actors believe they dial slack.com directly; cluster DNS points those
-// hostnames at this broker, which terminates TLS with a per-SNI certificate
-// signed by a CA the actors trust. The broker captures the app-level token from
-// the actor's apps.connections.open, holds the real Slack connection itself,
-// filters keepalive/hello frames, and — when a real message arrives while the
-// actor is suspended — resumes the actor via the substrate Control API and
-// delivers the buffered event when the actor's connection signals ready.
+// Actors believe they dial the provider directly; their traffic is redirected to
+// this broker, which terminates TLS with a per-SNI certificate signed by a CA the
+// actors trust. The broker captures the app token from the actor's bootstrap,
+// holds the real provider connection itself, and — when a real message arrives
+// while the actor is suspended — resumes the actor via the substrate Control API
+// and delivers the buffered event when the actor's connection signals ready.
 //
 // See README.md for the full design.
 package main
@@ -39,6 +24,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -49,13 +35,8 @@ func main() {
 		listenAddr   = pflag.String("listen", ":443", "TLS listen address for actor-facing traffic")
 		caCertFile   = pflag.String("ca-cert", "/etc/ws-poc/ca/tls.crt", "Broker CA certificate (PEM) used to mint per-SNI leaves")
 		caKeyFile    = pflag.String("ca-key", "/etc/ws-poc/ca/tls.key", "Broker CA private key (PEM)")
-		dnsUpstream  = pflag.String("dns-upstream", "8.8.8.8:53", "Upstream DNS used to reach REAL Slack, bypassing the cluster DNS redirect")
-		slackAPIBase = pflag.String("slack-api-base", "https://slack.com", "Base URL for real Slack API (override for testing)")
-		wssHost      = pflag.String("wss-host", "wss-primary.slack.com", "Host embedded in the synthesized wss URL; must be DNS-mapped to the broker")
-		wssPath      = pflag.String("wss-path", "/ws-poc/socketmode", "Path the actor's Socket Mode WebSocket connects to")
 		ateapiAddr   = pflag.String("ateapi-address", "api.ate-system.svc:443", "Substrate Control API (ateapi) address")
 		bootOnResume = pflag.Bool("boot-on-resume", false, "Boot actors fresh on resume instead of restoring the checkpoint")
-		deliverDelay = pflag.Duration("deliver-delay", 0, "Fallback: deliver buffered events this long after (re)connect even if no heartbeat is seen. Normally delivery is triggered by the client's first heartbeat (its connected:ready signal). 0 = heartbeat-only")
 		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "Suspend an actor after its broker-facing connection is quiet in both directions (no event, ack, or forwarded API call; keepalive pings excluded) for this long. 0 disables broker-driven suspend")
 	)
 	pflag.Parse()
@@ -76,9 +57,9 @@ func main() {
 	}
 	control := newControlClient(api, *bootOnResume)
 
-	realSlack := newRealSlackDialer(*dnsUpstream, *slackAPIBase)
-	reg := NewRegistry(control, control, realSlack, *deliverDelay, *idleGrace, log)
-	srv := NewServer(reg, control, realSlack, *wssHost, *wssPath, log)
+	dialer := slack.NewDialer()
+	reg := NewRegistry(control, control, dialer, *idleGrace, log)
+	srv := NewServer(reg, control, dialer, log)
 
 	httpServer := &http.Server{
 		Addr:      *listenAddr,
@@ -94,7 +75,7 @@ func main() {
 		_ = httpServer.Close()
 	}()
 
-	log.Info("egress-broker: broker listening", slog.String("addr", *listenAddr), slog.String("wss_host", *wssHost))
+	log.Info("egress-broker: broker listening", slog.String("addr", *listenAddr))
 	// Cert and key are provided by the minter's GetCertificate, so the file
 	// arguments are empty.
 	if err := httpServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {

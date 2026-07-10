@@ -1,20 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Build and deploy helpers for the WebSocket egress-broker PoC. Run from the
-# repo root. See README.md for the full runbook.
-
 SHELL := /bin/bash
 KO_DOCKER_REPO ?= localhost:5001
 export KO_DOCKER_REPO
@@ -44,10 +27,9 @@ help:
 	@echo "  build          - ko build the broker + build the actor image"
 	@echo "  deploy-broker  - apply broker + ca-installer (ko apply)"
 	@echo "  atelet-ca      - point atelet at the actor CA bundle (ATE_ACTOR_CA_BUNDLE)"
-	@echo "  coredns-patch  - add the slack.com -> broker CoreDNS rewrite"
 	@echo "  deploy-actor   - apply the echo-actor WorkerPool + ActorTemplate (needs BUCKET_NAME, ATEOM_IMAGE)"
 	@echo "  create-actor   - create the demo atespace + actor echo-1"
-	@echo "  deploy         - ca-secret + deploy-broker + atelet-ca + coredns-patch"
+	@echo "  deploy         - ca-secret + deploy-broker + atelet-ca"
 	@echo "  clean          - delete PoC resources"
 
 .PHONY: test
@@ -96,10 +78,6 @@ atelet-ca:
 	kubectl -n ate-system set env daemonset/atelet ATE_ACTOR_CA_BUNDLE=$(ATELET_CA_PATH)
 	kubectl -n ate-system rollout status daemonset/atelet --timeout=120s
 
-.PHONY: coredns-patch
-coredns-patch:
-	@bash $(CURDIR)/deploy/coredns-patch.sh
-
 .PHONY: deploy-actor
 deploy-actor: build-actor-image
 	@test -n "$(BUCKET_NAME)" || { echo "set BUCKET_NAME=<snapshot bucket>"; exit 1; }
@@ -117,7 +95,7 @@ create-actor:
 	kubectl ate create actor echo-1 -a demo --template ate-demo-ws-poc/echo
 
 .PHONY: deploy
-deploy: ca-secret deploy-broker atelet-ca coredns-patch
+deploy: ca-secret deploy-broker atelet-ca
 	@echo "Broker deployed. Now: make slack-secret APP_TOKEN=.. BOT_TOKEN=.. && make deploy-actor BUCKET_NAME=.. ATEOM_IMAGE=.. && make create-actor"
 
 .PHONY: clean

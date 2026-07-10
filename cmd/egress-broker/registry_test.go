@@ -1,17 +1,3 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
@@ -22,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
 // --- test doubles ---
 
 type fakeFrame struct {
-	env socketmode.Envelope
+	env slack.Envelope
 	raw []byte
 }
 
@@ -38,9 +24,9 @@ type fakeSlackConn struct {
 	acks   []string
 }
 
-func (f *fakeSlackConn) Read() (socketmode.Envelope, []byte, error) {
+func (f *fakeSlackConn) Read() (slack.Envelope, []byte, error) {
 	if f.idx >= len(f.frames) {
-		return socketmode.Envelope{}, nil, io.EOF // ends readSlackUntilClose
+		return slack.Envelope{}, nil, io.EOF // ends readSlackUntilClose
 	}
 	fr := f.frames[f.idx]
 	f.idx++
@@ -101,13 +87,13 @@ func discardLogger() *slog.Logger {
 }
 
 func newTestSession(resumer Resumer) *session {
-	reg := NewRegistry(resumer, nil, nil, 0, 0, discardLogger())
+	reg := NewRegistry(resumer, nil, nil, 0, discardLogger())
 	return &session{ref: ActorRef{Atespace: "demo", Name: "echo-1"}, reg: reg}
 }
 
 func eventFrame(id string) fakeFrame {
 	raw := []byte(`{"type":"events_api","envelope_id":"` + id + `","payload":{"type":"event_callback"}}`)
-	env, _ := socketmode.DecodeEnvelope(raw)
+	env, _ := slack.DecodeEnvelope(raw)
 	return fakeFrame{env: env, raw: raw}
 }
 
@@ -118,7 +104,7 @@ func TestReadSlackIgnoresConnectionManagement(t *testing.T) {
 	resumer := &fakeResumer{}
 	s := newTestSession(resumer)
 	conn := &fakeSlackConn{frames: []fakeFrame{
-		{env: socketmode.Envelope{Type: socketmode.TypeHello, NumConnections: 1}},
+		{env: slack.Envelope{Type: slack.TypeHello, NumConnections: 1}},
 	}}
 
 	s.readSlackUntilClose(conn, make(chan struct{}))
@@ -187,14 +173,14 @@ func TestAttachRedeliversBufferedEventsUntilAcked(t *testing.T) {
 	if len(frames) != 3 {
 		t.Fatalf("actor received %d frames, want 3 (hello + 2 events)", len(frames))
 	}
-	if got, _ := socketmode.DecodeEnvelope(frames[0]); got.Type != socketmode.TypeHello {
+	if got, _ := slack.DecodeEnvelope(frames[0]); got.Type != slack.TypeHello {
 		t.Errorf("first frame type = %q, want hello", got.Type)
 	}
 	// Delivered events carry FRESH, distinct envelope ids (not Slack's originals),
 	// so a client that dedupes by envelope_id won't drop a redelivery.
-	e1, _ := socketmode.DecodeEnvelope(frames[1])
-	e2, _ := socketmode.DecodeEnvelope(frames[2])
-	if !e1.IsEvent() || !e2.IsEvent() {
+	e1, _ := slack.DecodeEnvelope(frames[1])
+	e2, _ := slack.DecodeEnvelope(frames[2])
+	if e1.Type != slack.TypeEventsAPI || e2.Type != slack.TypeEventsAPI {
 		t.Errorf("delivered frames are not both events: %q, %q", e1.Type, e2.Type)
 	}
 	if e1.EnvelopeID == "" || e2.EnvelopeID == "" || e1.EnvelopeID == e2.EnvelopeID {
@@ -225,8 +211,8 @@ func TestAttachRedeliversBufferedEventsUntilAcked(t *testing.T) {
 	}
 
 	// Acking the fresh ids from the latest delivery clears the buffer.
-	r1, _ := socketmode.DecodeEnvelope(redelivered[1])
-	r2, _ := socketmode.DecodeEnvelope(redelivered[2])
+	r1, _ := slack.DecodeEnvelope(redelivered[1])
+	r2, _ := slack.DecodeEnvelope(redelivered[2])
 	s.Ack(r1.EnvelopeID)
 	s.Ack(r2.EnvelopeID)
 	s.mu.Lock()
@@ -262,8 +248,8 @@ func TestEventWhileAttachedDeliversWithoutResume(t *testing.T) {
 	if len(frames) != 2 {
 		t.Fatalf("actor received %d frames, want 2 (hello + event)", len(frames))
 	}
-	e, _ := socketmode.DecodeEnvelope(frames[1])
-	if !e.IsEvent() {
+	e, _ := slack.DecodeEnvelope(frames[1])
+	if e.Type != slack.TypeEventsAPI {
 		t.Errorf("delivered frame type = %q, want an event", e.Type)
 	}
 	if e.EnvelopeID == "" || e.EnvelopeID == "env-9" {
@@ -273,7 +259,7 @@ func TestEventWhileAttachedDeliversWithoutResume(t *testing.T) {
 
 // Registry keys sessions per actor.
 func TestRegistryGetOrCreateIsPerActor(t *testing.T) {
-	reg := NewRegistry(&fakeResumer{}, nil, nil, 0, 0, discardLogger())
+	reg := NewRegistry(&fakeResumer{}, nil, nil, 0, discardLogger())
 	a1 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
 	a1b := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
 	a2 := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-2"})

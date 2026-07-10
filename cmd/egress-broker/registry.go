@@ -1,17 +1,3 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
@@ -23,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
 // actorSink is the broker's write side of the actor-facing Socket Mode
@@ -35,7 +21,7 @@ type actorSink interface {
 }
 
 // helloFrame is the constant hello a Slack Socket Mode server sends on connect.
-var helloFrame = mustJSON(socketmode.Envelope{Type: socketmode.TypeHello, NumConnections: 1})
+var helloFrame = mustJSON(slack.Envelope{Type: slack.TypeHello, NumConnections: 1})
 
 func mustJSON(v any) []byte {
 	b, err := json.Marshal(v)
@@ -52,15 +38,8 @@ func mustJSON(v any) []byte {
 type Registry struct {
 	resumer   Resumer
 	suspender Suspender
-	dialer    SlackDialer
+	dialer    *slack.Dialer
 	log       *slog.Logger
-
-	// deliverDelay holds buffered events for this long after an actor
-	// (re)connects before delivering them, giving a client that reconnects with
-	// churn (Bolt after a checkpoint/restore) time to settle onto a stable
-	// connection first. The timer resets on each reconnect. Zero = deliver
-	// immediately.
-	deliverDelay time.Duration
 
 	// idleGrace is how long the actor's broker-facing connection may be quiet in
 	// both directions (no delivered event, no ack, no forwarded API call;
@@ -73,18 +52,17 @@ type Registry struct {
 }
 
 // NewRegistry builds a Registry.
-func NewRegistry(resumer Resumer, suspender Suspender, dialer SlackDialer, deliverDelay, idleGrace time.Duration, log *slog.Logger) *Registry {
+func NewRegistry(resumer Resumer, suspender Suspender, dialer *slack.Dialer, idleGrace time.Duration, log *slog.Logger) *Registry {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Registry{
-		resumer:      resumer,
-		suspender:    suspender,
-		dialer:       dialer,
-		deliverDelay: deliverDelay,
-		idleGrace:    idleGrace,
-		log:          log,
-		sessions:     make(map[ActorRef]*session),
+		resumer:   resumer,
+		suspender: suspender,
+		dialer:    dialer,
+		idleGrace: idleGrace,
+		log:       log,
+		sessions:  make(map[ActorRef]*session),
 	}
 }
 
@@ -120,13 +98,12 @@ type session struct {
 	closed   bool
 	stop     chan struct{}
 
-	sink       actorSink         // current actor-facing connection; nil when suspended/disconnected
-	resuming   bool              // a resume is in flight (or the actor is booting) — don't trigger another
-	buffer     []pendingEvent    // events awaiting the actor's ack; redelivered on every (re)connect
-	nextKey    uint64            // per-event internal key generator
-	freshIDs   map[string]uint64 // freshly minted actor-facing envelope_id -> event key
-	settled    bool              // true once the post-attach settle delay has elapsed
-	deliverTmr *time.Timer       // fires when the connection is considered settled
+	sink     actorSink         // current actor-facing connection; nil when suspended/disconnected
+	resuming bool              // a resume is in flight (or the actor is booting) — don't trigger another
+	buffer   []pendingEvent    // events awaiting the actor's ack; redelivered on every (re)connect
+	nextKey  uint64            // per-event internal key generator
+	freshIDs map[string]uint64 // freshly minted actor-facing envelope_id -> event key
+	settled  bool              // true once the actor's connection has signaled ready
 
 	// Broker-driven idle suspend. idleTmr fires idleGrace after the last activity
 	// (delivery, ack, or forwarded API call) and suspends the actor from outside.
@@ -282,7 +259,7 @@ func (s *session) runSlack(stop <-chan struct{}) {
 }
 
 // readSlackUntilClose reads envelopes until the connection errors or stop fires.
-func (s *session) readSlackUntilClose(conn SlackConn, stop <-chan struct{}) {
+func (s *session) readSlackUntilClose(conn slack.Conn, stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:
@@ -298,12 +275,12 @@ func (s *session) readSlackUntilClose(conn SlackConn, stop <-chan struct{}) {
 		}
 
 		switch {
-		case env.IsConnectionManagement():
+		case env.Type == slack.TypeHello || env.Type == slack.TypeDisconnect:
 			// hello / disconnect: lifecycle traffic that must never wake the
 			// actor. slack-go reconnects on its own, so just drop it.
 			s.reg.log.Debug("egress-broker: ignoring Slack connection-management frame",
 				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
-		case env.IsEvent():
+		case env.Type == slack.TypeEventsAPI:
 			// Ack to Slack immediately (within the ~3s window) so it is not
 			// redelivered, then buffer + deliver to the actor.
 			if err := conn.Ack(env.EnvelopeID); err != nil {
@@ -365,7 +342,7 @@ func (s *session) stampLocked(e pendingEvent) []byte {
 	}
 	fresh := randID()
 	s.freshIDs[fresh] = e.key
-	orig, _ := socketmode.DecodeEnvelope(e.raw)
+	orig, _ := slack.DecodeEnvelope(e.raw)
 	s.reg.log.Info("egress-broker: delivering event to actor",
 		slog.String("actor", s.ref.String()),
 		slog.String("slack_envelope_id", orig.EnvelopeID),
@@ -483,11 +460,6 @@ func (s *session) Attach(sink actorSink) {
 	s.sink = sink
 	s.resuming = false
 	s.settled = false
-	if s.deliverTmr != nil {
-		s.deliverTmr.Stop()
-		s.deliverTmr = nil
-	}
-	delay := s.reg.deliverDelay
 	buffered := len(s.buffer)
 	s.mu.Unlock()
 
@@ -502,15 +474,9 @@ func (s *session) Attach(sink actorSink) {
 		return
 	}
 	// Hold buffered events until the client's first heartbeat (MarkReady) — its
-	// connected:ready signal. delay>0 arms an optional fallback in case a client
-	// never heartbeats; delay==0 means heartbeat-only (no fallback).
+	// connected:ready signal.
 	s.reg.log.Info("egress-broker: holding buffered events until the client's first heartbeat",
-		slog.String("actor", s.ref.String()), slog.Duration("fallback", delay), slog.Int("buffered", buffered))
-	if delay > 0 {
-		s.mu.Lock()
-		s.deliverTmr = time.AfterFunc(delay, func() { s.deliverBufferedNow(sink, "fallback-timeout") })
-		s.mu.Unlock()
-	}
+		slog.String("actor", s.ref.String()), slog.Int("buffered", buffered))
 }
 
 // MarkReady is called when the actor's connection proves it is established —
@@ -534,10 +500,6 @@ func (s *session) deliverBufferedNow(sink actorSink, trigger string) {
 		return
 	}
 	s.settled = true
-	if s.deliverTmr != nil {
-		s.deliverTmr.Stop()
-		s.deliverTmr = nil
-	}
 	frames := s.buildEventFramesLocked()
 	s.mu.Unlock()
 
@@ -562,10 +524,6 @@ func (s *session) Detach(sink actorSink) {
 		s.settled = false
 		s.suspending = false
 		s.inFlight = 0
-		if s.deliverTmr != nil {
-			s.deliverTmr.Stop()
-			s.deliverTmr = nil
-		}
 		if s.idleTmr != nil {
 			s.idleTmr.Stop()
 			s.idleTmr = nil

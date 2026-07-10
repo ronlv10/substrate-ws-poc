@@ -42,8 +42,8 @@ phase should replace the broad masquerade path with transparent TCP capture").
                        persistent, survives actor suspend
   Slack  <===== wss (real TLS, broker holds it) =====>  BROKER  ── gRPC ResumeActor ──>  ateapi
                                                             │   (in-cluster Deployment;
-   actor believes it dials slack.com;                       │    reaches real Slack via its
-   cluster DNS points slack.com at the broker; broker        │    own upstream resolver)
+   actor believes it dials slack.com;                       │    reaches real Slack via the
+   its /etc/hosts points slack.com at the broker; broker      │    default cluster resolver)
    terminates TLS with a per-SNI cert the actor trusts        │
         ECHO ACTOR  <===== wss + HTTPS (MITM'd) =====>  BROKER
         (Socket Mode client + /readyz;                       forwards chat.postMessage → real Slack
@@ -93,7 +93,7 @@ delivered and never wake the actor.
 | `echo-actor/` | A normal Slack Bolt (Node) bot that echoes messages and exposes `/readyz`. It has no knowledge of the broker or of its own suspend/resume. |
 | `internal/socketmode/` | The small Socket Mode envelope types the broker uses. |
 | `internal/slackapi/` | The Slack Web API shape the broker synthesizes (`apps.connections.open`). |
-| `deploy/` | Broker Deployment/Service, CA installer DaemonSet, echo-actor WorkerPool/ActorTemplate, CoreDNS rewrite. |
+| `deploy/` | Broker Deployment/Service, CA installer DaemonSet, echo-actor WorkerPool/ActorTemplate. |
 | `certs/` | Broker CA generation. |
 
 This is a standalone Go module (`github.com/ronlv10/substrate-ws-poc`). It
@@ -103,11 +103,12 @@ identity), so no substrate `internal/` packages are imported.
 
 ## Transparent redirect and CA trust (PoC mechanisms)
 
-- **Redirect — CoreDNS.** A cluster-wide `rewrite` rule points `slack.com` and
-  `wss-primary.slack.com` at the broker Service. Actors pick this up through the
-  worker pod's `/etc/resolv.conf`. The broker reaches *real* Slack via its own
-  upstream resolver (`--dns-upstream`, default `8.8.8.8:53`), so it is not caught
-  by its own rewrite. See `deploy/coredns-rewrite.md`.
+- **Redirect — per-actor `/etc/hosts`.** The actor's `entrypoint.sh` resolves the
+  broker Service (`BROKER_SERVICE`, a stable ClusterIP) and appends
+  `<ip> slack.com wss-primary.slack.com` to its own `/etc/hosts` before starting
+  Bolt. `slack.com` stays the TLS SNI, so the broker's cert still matches. The
+  redirect lives only in the actor, so the broker is never caught by it and cluster
+  DNS is untouched — no upstream-resolver workaround, no blast radius.
 - **CA trust — node bundle mounted into actors.** `certs/gen-ca.sh` produces the
   broker CA. The `ca-installer` DaemonSet publishes `system CAs + broker CA` to
   the shared ateom hostPath on every node, and atelet is pointed at it via the
@@ -151,9 +152,9 @@ branch so the atelet image includes these changes.
 ```bash
 # From the repo root.
 
-# 1. Broker CA + secret, broker + CA installer, atelet wiring, DNS rewrite.
+# 1. Broker CA + secret, broker + CA installer, atelet wiring.
 make gen-ca
-make deploy                 # ca-secret + deploy-broker + atelet-ca + coredns-patch
+make deploy                 # ca-secret + deploy-broker + atelet-ca
 
 # 2. Slack tokens (stored in the actor's namespace only).
 make slack-secret APP_TOKEN=xapp-... BOT_TOKEN=xoxb-...
@@ -199,21 +200,18 @@ per-actor session keying — using fakes, no cluster required.
 
 ## Blast radius (accepted for this PoC)
 
-The CoreDNS rewrite and the CA mount are **cluster-wide**: every actor's
-`slack.com` traffic routes through the broker and every actor trusts the broker
-CA. To avoid breaking other Slack-using actors, the broker forwards all
-`slack.com/api/*` calls it does not specifically handle straight to real Slack.
-This is acceptable on a dedicated demo cluster; see below for the scoped
-production design.
+The redirect is per-actor (`/etc/hosts`), so it has no blast radius. The one
+cluster-wide mechanism left is the **CA mount**: atelet mounts the broker CA into
+every actor sandbox, so every actor trusts it. That is acceptable on a dedicated
+demo cluster; production would gate the CA per ActorTemplate (see below).
 
 ## Production hardening (documented, not built)
 
-- **Per-workload transparent capture.** Replace the cluster-wide CoreDNS rewrite
-  with in-pod `nftables` TPROXY/DNAT egress capture in
-  `cmd/ateom-gvisor/main.go` (`installActorNftablesRules`) and
-  `cmd/ateom-microvm/net.go`, scoped to opted-in actors. This also captures
-  IP-literal egress (which DNS redirect cannot) and is the sanctioned
-  "AgentGateway" direction.
+- **Per-workload transparent capture.** The `/etc/hosts` redirect only catches
+  hostname egress; production would use in-pod `nftables` TPROXY/DNAT egress
+  capture in `cmd/ateom-gvisor/main.go` (`installActorNftablesRules`) and
+  `cmd/ateom-microvm/net.go`, scoped to opted-in actors. That also catches
+  IP-literal egress and is the sanctioned "AgentGateway" direction.
 - **Centrally managed CA**, gated per ActorTemplate rather than cluster-wide.
 - **Multi-tenant Socket Mode.** The broker forwards HTTPS for any actor but only
   brokers Socket Mode for identified WS-PoC actors; full per-app Socket Mode
