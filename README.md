@@ -1,190 +1,165 @@
-# WS-PoC — a Slack egress broker for suspendable agents
+# WS-PoC — a Slack agent that stays online while suspended
 
-WS-PoC is a proof of concept for running an **always-on Slack agent on
-agent-substrate while it is suspended almost all of the time**. A normal Slack
-bot holds a long-lived WebSocket (Socket Mode) and idles waiting for messages.
-On substrate, suspending an actor is a process checkpoint that frees the worker
-and **destroys every socket the actor holds** — so an actor can never keep a
-Slack WebSocket alive across a suspend.
+WS-PoC runs an **always-on Slack agent on agent-substrate while it is suspended
+almost all of the time**. A Slack bot holds a long-lived Socket Mode WebSocket
+and idles waiting for messages; on substrate, suspending an actor checkpoints
+the process and **destroys every socket it holds**, so a stock bot cannot keep
+that WebSocket alive across a suspend.
 
-WS-PoC solves this by **inverting socket ownership**. An always-on *egress
-broker* owns the persistent connection to Slack. The actor still believes it
-dials `slack.com` directly; its traffic is transparently redirected to the
-broker, which terminates TLS with a certificate the actor trusts and holds the
-real Slack socket itself. While the actor is suspended the broker keeps the
-Slack connection open and filters keepalive frames. When a real message
-arrives, the broker resumes the actor, the actor reconnects, and the broker
-delivers the buffered message. The actor replies `echo: <message>`, and once it
-goes idle the broker suspends it again.
-
-This is a concrete first step toward the "AgentGateway" egress phase already
-flagged in the codebase (`cmd/ateom-gvisor/main.go` — "the later AgentGateway
-phase should replace the broad masquerade path with transparent TCP capture").
-
-## Why this is the only shape that works
-
-- Suspend is `runsc` checkpoint/restore (substrate runs it with
-  `--allow-connected-on-save`). An established outbound TCP cannot be restored
-  onto a different worker with a different pod IP, so the socket is dead after a
-  restore — the process must **reconnect**. Socket Mode clients already
-  reconnect on `disconnect`, so a stock bot needs no changes.
-- Therefore the durable Slack connection must live **outside** the actor. The
-  broker owns it; the actor's connection to the broker is ephemeral and
-  re-established on each resume.
-- `Control.ResumeActor` blocks until the actor's `/readyz` returns 200, so
-  "resume, then the actor reconnects and we deliver" is race-free by construction.
-- All actor↔broker traffic is actor-initiated **egress**, so the broker never
-  needs the inbound atenet router or the actor's pod IP to deliver a message.
+v2 solves this with a **local egress proxy baked into the actor image**. The
+agent (stock Bolt) talks Socket Mode to the proxy over **loopback** — a
+connection whose endpoints are both inside the sandbox, so `runsc`
+checkpoint/restore preserves it intact and the agent never sees a dead socket.
+The proxy speaks a resumable gRPC protocol to an always-on **egress broker**,
+which owns the real, persistent Slack connection. On suspend only the
+proxy↔broker leg drops; on resume the proxy redials and the agent's own socket
+is already there.
 
 ## Architecture
 
-```
-                       persistent, survives actor suspend
-  Slack  <===== wss (real TLS, broker holds it) =====>  BROKER  ── gRPC ResumeActor ──>  ateapi
-                                                            │   (in-cluster Deployment;
-   actor believes it dials slack.com;                       │    reaches real Slack via its
-   cluster DNS points slack.com at the broker; broker        │    own upstream resolver)
-   terminates TLS with a per-SNI cert the actor trusts        │
-        ECHO ACTOR  <===== wss + HTTPS (MITM'd) =====>  BROKER
-        (Socket Mode client + /readyz;                       forwards chat.postMessage → real Slack
-         broker suspends it when idle)                       captures the xapp- app token from traffic
+```mermaid
+flowchart LR
+    Slack(["Slack"])
+
+    subgraph K8s["Kubernetes cluster · agent-substrate"]
+        direction TB
+        CP["Substrate control plane"]
+        Broker["Egress Broker<br/>persistent · always-on"]
+        subgraph Actor["Echo Actor · suspended between messages"]
+            direction TB
+            Agent["@slack/bolt — stock echo bot"]
+            Proxy["Local proxy<br/>impersonates slack.com"]
+            Agent <-->|"Socket Mode WS · loopback<br/>survives checkpoint"| Proxy
+        end
+        Broker -- "Resume / Suspend Actor" --> CP
+        Proxy <-.->|"gRPC session · only while resumed"| Broker
+        CP -.->|restore / checkpoint| Actor
+    end
+
+    Slack <==>|Socket Mode WSS · persistent| Broker
+
+    linkStyle 0 stroke:#3ec7d4,stroke-width:3px
+    linkStyle 3 stroke:#2ea043,stroke-width:2px
+    linkStyle 5 stroke:#3ec7d4,stroke-width:2px
+
+    classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
+    classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
+    classDef broker fill:#2a1e07,stroke:#d99a1c,color:#fde9b8;
+    classDef actor fill:#0c2417,stroke:#3f8f5f,color:#cfe8d6;
+    class Slack slack
+    class CP cp
+    class Broker broker
+    class Agent,Proxy actor
 ```
 
-Two live connections, bridged by the broker:
+Three connections, two of them durable across suspend:
 
-- **Broker ↔ Slack** — a real Socket Mode WebSocket over real TLS, kept open
+- **Broker ↔ Slack** — a real Socket Mode WebSocket over real TLS, held open
   across the actor's suspend/resume cycles. Opened with the app-level token the
-  broker captured from the actor's own `apps.connections.open` (the broker holds
+  broker captured from the agent's own `apps.connections.open` (the broker holds
   **no** pre-shared Slack secrets).
-- **Actor ↔ Broker** — a stock Socket Mode client whose `slack.com` traffic is
-  redirected to the broker. Ephemeral: it dies on suspend and the actor
-  re-establishes it on resume.
+- **Agent ↔ Proxy** — a stock Socket Mode client over loopback TLS. Both ends
+  are in the same sandbox, so the checkpoint preserves it; the agent's process
+  memory survives too.
+- **Proxy ↔ Broker** — a gRPC session (`proto/brokerproxy`). This is the only
+  leg that dies on suspend; the proxy redials and re-announces on resume,
+  resuming the event stream from its last ack.
 
-State is keyed **per actor** (`atespace/name`), so each Slack connection maps to
-exactly one actor and inbound events route unambiguously. The actor announces its
-own identity in an `X-Ate-Actor` header (read fresh from its per-resume `/run/ate`
-mount); the broker falls back to source-IP correlation (`Actor.AteomPodIp` from
-the Control API) only when the header is absent.
+The agent still churns its Socket Mode connection once *locally* after each
+restore (its pong-staleness check reads the wall clock, which jumps on
+restore), but that reconnect is a ~40ms loopback round-trip to the co-resident
+proxy — and the proxy holds each event until the reconnected agent heartbeats,
+so nothing lands in the churn window.
 
 ### Message lifecycle
 
-1. First run: the actor connects, the broker captures the app token and opens
-   the persistent Slack connection; the actor goes idle and the broker suspends it.
+1. First run: the agent connects to the proxy, the proxy announces to the broker
+   with the captured app token, the broker opens the persistent Slack connection,
+   and the actor is suspended once idle.
 2. A user posts in Slack → the broker's Slack connection receives an
    `events_api` envelope.
-3. The broker acks Slack immediately (within the ~3s window, so Slack does not
-   redeliver), buffers the event, and calls `ResumeActor`.
-4. `ResumeActor` returns once the actor is live; the actor's Socket Mode client
-   reconnects (its old socket died on restore).
-5. The broker attaches the reconnected actor, sends `hello`, and drains the
-   buffered event(s).
-6. The actor replies `echo: <text>` via `chat.postMessage` (forwarded through the
-   broker to real Slack). After an idle grace period, the broker suspends it again
-   from the outside.
+3. The broker acks Slack immediately (within the ~3s window), buffers the event,
+   and calls `ResumeActor`.
+4. On resume the proxy redials the broker and re-announces; the broker re-sends
+   the buffered event over the gRPC session.
+5. The proxy delivers it to the agent over the surviving loopback socket, once
+   the agent has heartbeated on its (reconnected) connection.
+6. The agent replies `echo: <text>` via `chat.postMessage`, which the proxy
+   relays to the broker and on to real Slack. After an idle grace period, the
+   broker suspends the actor from the outside.
 
-Slack `hello` / `disconnect` frames and WebSocket ping/pong are **never**
-delivered and never wake the actor.
+Slack `hello` / `disconnect` frames and WebSocket ping/pong never wake the actor.
 
-## Components
+## Layout
 
 | Path | What it is |
 |------|------------|
-| `cmd/egress-broker/` | The egress broker: per-SNI TLS minting, Slack HTTPS handling (synthesize `apps.connections.open`, capture tokens, forward the rest), persistent Socket Mode client to Slack, Socket Mode server facing the actor, per-actor event buffer, and the `ResumeActor` client. |
-| `echo-actor/` | A normal Slack Bolt (Node) bot that echoes messages and exposes `/readyz`. It has no knowledge of the broker or of its own suspend/resume. |
-| `internal/socketmode/` | The small Socket Mode envelope types the broker uses. |
-| `internal/slackapi/` | The Slack Web API shape the broker synthesizes (`apps.connections.open`). |
-| `deploy/` | Broker Deployment/Service, CA installer DaemonSet, echo-actor WorkerPool/ActorTemplate, CoreDNS rewrite. |
-| `certs/` | Broker CA generation. |
+| `cmd/egress-broker/` | Thin wiring: flags, gRPC server, control-plane dial. |
+| `internal/broker/` | Broker runtime: per-actor session, event buffer, resume/suspend, gRPC session handler. |
+| `internal/slack/` | Slack wire types and the persistent connection to real Slack (slack-go). |
+| `cmd/local-proxy/` + `internal/proxy/` | The in-actor proxy: Slack impersonation on loopback, hold-until-heartbeat delivery, broker session client, PID-1 supervisor. |
+| `proto/brokerproxy/` | The broker↔proxy gRPC protocol. |
+| `echo-actor/` | The stock Bolt bot and the image that bundles it with the proxy. |
+| `deploy/`, `certs/` | Broker Deployment/Service, actor template, proxy cert generation. |
+| `spikes/` | The phase-0 experiments that validated loopback survival and the Bolt churn. |
 
-This is a standalone Go module (`github.com/ronlv10/substrate-ws-poc`). It
-depends on public substrate only for the generated `ateapipb` gRPC client; the
-ateapi connection is dialed with `InsecureSkipVerify` (in-cluster mTLS
-identity), so no substrate `internal/` packages are imported.
+Standalone Go module (`github.com/ronlv10/substrate-ws-poc`); it depends on
+public substrate only for the generated `ateapipb` gRPC client.
 
-## Transparent redirect and CA trust (PoC mechanisms)
+## Redirect and trust — per image, no cluster-wide blast radius
 
-- **Redirect — CoreDNS.** A cluster-wide `rewrite` rule points `slack.com` and
-  `wss-primary.slack.com` at the broker Service. Actors pick this up through the
-  worker pod's `/etc/resolv.conf`. The broker reaches *real* Slack via its own
-  upstream resolver (`--dns-upstream`, default `8.8.8.8:53`), so it is not caught
-  by its own rewrite. See `deploy/coredns-rewrite.md`.
-- **CA trust — node bundle mounted into actors.** `certs/gen-ca.sh` produces the
-  broker CA. The `ca-installer` DaemonSet publishes `system CAs + broker CA` to
-  the shared ateom hostPath on every node, and atelet is pointed at it via the
-  `ATE_ACTOR_CA_BUNDLE` env var; atelet then bind-mounts it into every actor
-  sandbox over `/etc/ssl/certs/ca-certificates.crt`.
+- **Redirect.** The actor image's `/etc/hosts` points `slack.com` and
+  `wss-primary.slack.com` at `127.0.0.1`, where the proxy listens. atelet mounts
+  nothing over `/etc/hosts`, so this is entirely self-contained — no CoreDNS
+  rewrite.
+- **Trust.** The image bakes a CA and a `slack.com` leaf (`certs/gen-proxy-cert.sh`);
+  the agent trusts it via `NODE_EXTRA_CA_CERTS`. No node-level CA install.
 
-### The substrate changes (in the fork)
+### Identity
 
-The only substrate-side changes live on the **`ws-poc` branch of the substrate
-fork**: <https://github.com/ronlv10/substrate/tree/ws-poc>. Both are additive and
-opt-in (`cmd/atelet/oci.go`, `cmd/atelet/main.go`):
-
-- when atelet is started with `ATE_ACTOR_CA_BUNDLE=<path>`, it bind-mounts that
-  CA bundle read-only over the actor's system CA store (inert when unset), so
-  actors trust the broker's CA;
-- atelet also writes the actor's atespace into the per-resume identity mount
-  (`/run/ate/atespace`) so an actor can read its own identity — the echo actor
-  sends it to the broker as the `X-Ate-Actor` header.
-
-Everything else uses the existing Control API. Build the cluster from that fork
-branch so the atelet image includes these changes.
-
-## Prerequisites
-
-- A running substrate cluster built from the `ws-poc` fork branch (kind
-  quickstart: `hack/create-kind-cluster.sh && hack/install-ate-kind.sh
-  --deploy-ate-system`). Note the snapshot bucket (`BUCKET_NAME`) and build the
-  `ateom-gvisor` image (`ko build github.com/agent-substrate/substrate/cmd/ateom-gvisor`)
-  — pass its digest as `ATEOM_IMAGE`.
-- A Slack app with **Socket Mode enabled**. Collect:
-  - an **app-level token** (`xapp-…`) with `connections:write`,
-  - a **bot token** (`xoxb-…`) with `chat:write`,
-  - event subscriptions for `message.channels` (and/or `app_mention`),
-  - the bot invited to a test channel.
-  The tokens live only in the actor's `slack-tokens` secret; the broker learns
-  them from traffic.
-- `ko`, `kubectl`, `kubectl-ate`, `jq`, `openssl`.
+The proxy reads its own identity (`atespace/name`) fresh from the per-resume
+`/run/ate` mount on every broker (re)connect and sends it in its `Announce` —
+never cached, because a golden-restored actor reads the template's identity
+until the mount is regenerated on resume. This needs the `/run/ate/atespace`
+write from the substrate fork's **`ws-poc` branch**
+(<https://github.com/ronlv10/substrate/tree/ws-poc>), which is the only
+substrate-side change v2 requires.
 
 ## Deploy (kind)
 
 ```bash
-# From the repo root.
+# A substrate cluster built from the ws-poc fork branch, e.g.
+#   hack/create-kind-cluster.sh && hack/install-ate-kind.sh --deploy-ate-system
+# Note BUCKET_NAME and build ateom-gvisor (ko build .../cmd/ateom-gvisor) → ATEOM_IMAGE.
 
-# 1. Broker CA + secret, broker + CA installer, atelet wiring, DNS rewrite.
-make gen-ca
-make deploy                 # ca-secret + deploy-broker + atelet-ca + coredns-patch
-
-# 2. Slack tokens (stored in the actor's namespace only).
+make deploy-broker
 make slack-secret APP_TOKEN=xapp-... BOT_TOKEN=xoxb-...
-
-# 3. The echo actor template + worker pool. ATEOM_IMAGE is the substrate
-#    ateom-gvisor image built from the fork.
-make deploy-actor BUCKET_NAME=<your-bucket> ATEOM_IMAGE=<ateom-gvisor-digest>
-
-# 4. Create the actor. Its first run bootstraps the broker's Slack connection.
+make deploy-actor BUCKET_NAME=<bucket> ATEOM_IMAGE=<digest> \
+     BROKER_ADDRESS=egress-broker.ws-poc.svc.cluster.local:9090
 make create-actor
 ```
 
+A Slack app with Socket Mode enabled is required: an app-level token (`xapp-…`,
+`connections:write`), a bot token (`xoxb-…`, `chat:write`), event subscriptions
+for `message.channels` / `app_mention`, and the bot invited to a channel. The
+tokens live only in the actor's `slack-tokens` secret.
+
+Omit `BROKER_ADDRESS` to deploy the proxy **standalone** — it stubs the Web API
+and injects synthetic events, exercising the whole agent-facing path (including
+suspend/resume) with no broker or real Slack.
+
 ## Demo
 
-1. Confirm the actor bootstrapped and then suspended:
-   ```bash
-   kubectl logs -n ws-poc deploy/egress-broker | grep "persistent Slack connection established"
-   kubectl ate get actors -a demo        # echo-1 → SUSPENDED
-   ```
-2. Post `hello world` in the test channel. Watch it wake, reply, and re-suspend:
-   ```bash
-   kubectl logs -n ws-poc deploy/egress-broker -f
-   #   ... real Slack event received; delivering to actor
-   #   ... resuming suspended actor to deliver event
-   #   ... actor Socket Mode WebSocket attached
-   kubectl ate get actors -a demo        # RESUMING → RUNNING → SUSPENDED
-   ```
-   Slack shows `echo: hello world`. The broker's Slack connection never dropped.
-3. **Keepalive check:** leave it idle. Slack ping/`disconnect` frames appear in
-   the broker log as ignored connection-management traffic, and `echo-1` stays
-   `SUSPENDED` — keepalive does not wake the actor.
+Post `@bot hello` in the test channel and watch the actor wake, echo, and
+re-suspend:
+
+```bash
+kubectl -n ws-poc logs deploy/egress-broker -f
+#   ... real Slack event received; delivering to actor
+#   ... resuming suspended actor to deliver event
+#   ... proxy announced / proxy acked event / actor idle; suspending
+kubectl ate get actors -a demo        # RUNNING → SUSPENDED
+```
 
 ## Tests
 
@@ -192,32 +167,18 @@ make create-actor
 make test        # go test ./...
 ```
 
-Unit tests cover per-SNI certificate minting (leaves verify against the CA),
-Socket Mode envelope classification (keepalive vs. real event), the event
-buffer + immediate Slack-ack, keepalive filtering, resume orchestration, and
-per-actor session keying — using fakes, no cluster required.
+Covers the broker session (keepalive filtering, buffer + immediate Slack-ack,
+resume-once, attach/re-send by `last_acked_seq`, idle suspend), the gRPC session
+end to end over bufconn (announce/event/ack/egress, golden-skip), and the proxy
+(token capture, hold-until-heartbeat delivery, ack propagation, readiness) — all
+with fakes, no cluster.
 
-## Blast radius (accepted for this PoC)
+## Not built (backlog)
 
-The CoreDNS rewrite and the CA mount are **cluster-wide**: every actor's
-`slack.com` traffic routes through the broker and every actor trusts the broker
-CA. To avoid breaking other Slack-using actors, the broker forwards all
-`slack.com/api/*` calls it does not specifically handle straight to real Slack.
-This is acceptable on a dedicated demo cluster; see below for the scoped
-production design.
-
-## Production hardening (documented, not built)
-
-- **Per-workload transparent capture.** Replace the cluster-wide CoreDNS rewrite
-  with in-pod `nftables` TPROXY/DNAT egress capture in
-  `cmd/ateom-gvisor/main.go` (`installActorNftablesRules`) and
-  `cmd/ateom-microvm/net.go`, scoped to opted-in actors. This also captures
-  IP-literal egress (which DNS redirect cannot) and is the sanctioned
-  "AgentGateway" direction.
-- **Centrally managed CA**, gated per ActorTemplate rather than cluster-wide.
-- **Multi-tenant Socket Mode.** The broker forwards HTTPS for any actor but only
-  brokers Socket Mode for identified WS-PoC actors; full per-app Socket Mode
-  multiplexing (so unrelated Slack apps coexist) is the next extension.
+- **Multi-tenant Socket Mode.** One broker brokers many actors, but two actors
+  sharing a Slack app token would split its events; per-app session keying is the
+  next step.
 - **Durable buffer / HA.** The event buffer and captured tokens are in-memory; a
-  broker restart loses them until an actor reconnects. Production would persist
-  them and run the broker HA.
+  broker restart loses them until a proxy reconnects.
+- **Transport auth.** The broker's gRPC port is plaintext; identity of record is
+  the `Announce`. Production would add mTLS or a per-actor token.

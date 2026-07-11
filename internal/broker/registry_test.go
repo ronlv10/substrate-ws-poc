@@ -1,18 +1,4 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-package main
+package broker
 
 import (
 	"context"
@@ -23,10 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
-// fakeSlackConn feeds scripted frames to the session's Slack read loop.
+// --- test doubles ---
+
+// fakeSlackConn feeds scripted frames to readSlackUntilClose.
 type fakeSlackConn struct {
 	frames chan []byte
 	acked  chan string
@@ -36,22 +24,16 @@ func newFakeSlackConn() *fakeSlackConn {
 	return &fakeSlackConn{frames: make(chan []byte, 16), acked: make(chan string, 16)}
 }
 
-func (f *fakeSlackConn) Read() (socketmode.Envelope, []byte, error) {
+func (f *fakeSlackConn) Read() (slack.Envelope, []byte, error) {
 	raw, ok := <-f.frames
 	if !ok {
-		return socketmode.Envelope{}, nil, io.EOF
+		return slack.Envelope{}, nil, io.EOF
 	}
-	env, err := socketmode.DecodeEnvelope(raw)
+	env, err := slack.DecodeEnvelope(raw)
 	return env, raw, err
 }
 func (f *fakeSlackConn) Ack(id string) error { f.acked <- id; return nil }
 func (f *fakeSlackConn) Close() error        { return nil }
-
-type fakeDialer struct{ conn *fakeSlackConn }
-
-func (d *fakeDialer) Dial(ctx context.Context, token string) (SlackConn, error) {
-	return d.conn, nil
-}
 
 type fakeResumer struct {
 	mu    sync.Mutex
@@ -87,7 +69,7 @@ func (s *fakeSuspender) suspends() int {
 	return s.count
 }
 
-// fakeSink records delivered (seq, payload) pairs.
+// fakeSink records delivered seqs.
 type fakeSink struct {
 	mu     sync.Mutex
 	events []uint64
@@ -113,16 +95,19 @@ func eventFrame(id string) []byte {
 	return []byte(fmt.Sprintf(`{"type":"events_api","envelope_id":%q,"payload":{"type":"event_callback"}}`, id))
 }
 
+// newTestSession wires a session and drives its Slack read loop from a fake
+// connection (the real loop is started by EnsureStarted, which needs a dialer).
 func newTestSession(t *testing.T, idleGrace time.Duration) (*session, *fakeSlackConn, *fakeResumer, *fakeSuspender) {
 	t.Helper()
 	conn := newFakeSlackConn()
 	resumer := &fakeResumer{}
 	suspender := &fakeSuspender{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := NewRegistry(resumer, suspender, &fakeDialer{conn: conn}, idleGrace, log)
+	reg := NewRegistry(resumer, suspender, nil, idleGrace, log)
 	s := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
-	s.EnsureStarted("xapp-test")
-	t.Cleanup(func() { s.Close(); close(conn.frames) })
+	stop := make(chan struct{})
+	go s.readSlackUntilClose(conn, stop)
+	t.Cleanup(func() { close(stop); close(conn.frames) })
 	return s, conn, resumer, suspender
 }
 
@@ -153,7 +138,7 @@ func TestKeepaliveFramesNeverResume(t *testing.T) {
 	}
 }
 
-func TestEventWhileDetachedAcksSlackBuffersAndResumesOnce(t *testing.T) {
+func TestEventWhileDetachedBuffersAcksSlackAndResumesOnce(t *testing.T) {
 	s, conn, resumer, _ := newTestSession(t, 0)
 	conn.frames <- eventFrame("e1")
 	conn.frames <- eventFrame("e2")
@@ -213,7 +198,6 @@ func TestAckRemovesFromBuffer(t *testing.T) {
 		t.Fatalf("acked event still buffered: %d", buffered)
 	}
 
-	// A second attach re-sends nothing.
 	sink2 := &fakeSink{}
 	s.Attach(sink2, 0)
 	if got := sink2.delivered(); len(got) != 0 {
@@ -243,7 +227,6 @@ func TestIdleSuspendFiresAndForwardDefersIt(t *testing.T) {
 	s, _, _, suspender := newTestSession(t, 50*time.Millisecond)
 	sink := &fakeSink{}
 
-	// An in-flight relay holds off the idle suspend.
 	s.Attach(sink, 0)
 	s.beginForward()
 	time.Sleep(120 * time.Millisecond)

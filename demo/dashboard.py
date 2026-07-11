@@ -113,12 +113,10 @@ def classify(d):
         return {"type": "message", "t": t, "label": "Slack delivered a message on the persistent connection"}
     if "resuming suspended actor" in m:
         return {"type": "resume", "t": t, "label": "Broker calls ResumeActor on the substrate control plane"}
-    if "actor opened Socket Mode connection" in m and "golden" not in m:
-        return {"type": "boot", "t": t, "label": "Actor cold-booted and reconnected to the broker"}
-    if "connection established; delivering" in m:
-        return {"type": "deliver", "t": t, "label": "Broker delivers the buffered event to the actor"}
-    if "forwarded Slack API call" in m and "chat.postMessage" in p:
-        return {"type": "echo", "t": t, "label": f"Actor's echo forwarded to Slack (chat.postMessage {st})"}
+    if "proxy announced" in m and "golden" not in m:
+        return {"type": "boot", "t": t, "label": "Resumed actor's proxy reconnects and re-announces"}
+    if "proxy acked event" in m:
+        return {"type": "deliver", "t": t, "label": "Actor handled the event (proxy acked)"}
     if "idle; suspending from broker" in m:
         return {"type": "suspend", "t": t, "label": "Broker calls SuspendActor — checkpoints the actor from OUTSIDE"}
     return None
@@ -282,12 +280,12 @@ HTML = r"""<!doctype html>
       <path id="e-ateapi-actor" class="edge" d="M518,112 C610,112 600,175 636,214" fill="none" stroke="#3a4a63" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arw)"/>
       <text x="560" y="150" fill="#8595ad" font-size="12">restore / checkpoint</text>
 
-      <!-- Actor <-> Broker : EPHEMERAL Socket Mode WS — exists only while the actor
+      <!-- Proxy <-> Broker : EPHEMERAL gRPC session — exists only while the actor
            runs. The whole group fades IN when it connects and OUT (disappears) on
-           suspend. deliver (broker->actor) and echo (actor->broker) flow along it. -->
+           suspend. deliver (broker->proxy) and echo (proxy->broker) flow along it. -->
       <g id="ws-group" class="wsgroup">
         <path id="e-actor-ws" class="edge" d="M518,280 L634,280" fill="none" stroke="#3ec7d4" stroke-width="2.5" marker-start="url(#arwWs)" marker-end="url(#arwWs)"/>
-        <text x="576" y="266" fill="#bfeaf0" font-size="12" text-anchor="middle">Socket Mode WS</text>
+        <text x="576" y="266" fill="#bfeaf0" font-size="12" text-anchor="middle">gRPC session</text>
         <text id="ws-state" x="576" y="300" fill="#3ec7d4" font-size="11" text-anchor="middle">● connected</text>
       </g>
 
@@ -316,8 +314,8 @@ HTML = r"""<!doctype html>
         <circle id="st-actor" cx="894" cy="214" r="5" fill="#6b7688"/>
         <text x="772" y="228" fill="#e6edf5" font-size="14" font-weight="700" text-anchor="middle">Echo Actor</text>
         <rect x="656" y="248" width="232" height="86" rx="9" fill="#0c1a13" stroke="#1f3b2a"/>
-        <text x="772" y="278" fill="#e6edf5" font-size="13" font-weight="600" text-anchor="middle">@slack/bolt — echo bot</text>
-        <text x="772" y="298" fill="#8595ad" font-size="11" text-anchor="middle">stock Slack bot · NO lifecycle code</text>
+        <text x="772" y="272" fill="#e6edf5" font-size="13" font-weight="600" text-anchor="middle">@slack/bolt ⇄ local proxy</text>
+        <text x="772" y="290" fill="#8595ad" font-size="11" text-anchor="middle">stock bot + proxy · loopback WS survives</text>
         <text x="772" y="320" fill="#8595ad" font-size="11" text-anchor="middle" id="actor-sub">suspended / running…</text>
       </g>
     </svg>

@@ -1,23 +1,6 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# The echo actor: a normal Slack Socket Mode bot, run as a suspendable actor.
-# Apply with `ko apply -f` after substituting ${BUCKET_NAME}. It expects a
-# Secret named `slack-tokens` in this namespace holding the app-level and bot
-# tokens:
-#   kubectl -n ate-demo-ws-poc create secret generic slack-tokens \
-#       --from-literal=app-token=xapp-... --from-literal=bot-token=xoxb-...
+# The echo actor: a stock Slack Socket Mode bot plus its local proxy, run as a
+# suspendable actor. Substitute the ${...} vars (the Makefile does). Needs a
+# `slack-tokens` secret in this namespace (app-token, bot-token).
 
 apiVersion: v1
 kind: Namespace
@@ -81,13 +64,10 @@ spec:
   pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
   containers:
   - name: echo
-    # The Bolt (Node) actor image, built + pinned by the Makefile (${ECHO_IMAGE}
-    # is substituted with the pushed digest). substrate ignores image ENV/CMD, so
-    # the command and env below are authoritative.
+    # substrate ignores image ENV/CMD, so command and env here are authoritative.
     image: ${ECHO_IMAGE}
-    # The local proxy is PID 1; it binds loopback :443 and :80 first, then
-    # spawns the stock Bolt agent. An empty --broker-address runs the proxy
-    # standalone (Web API stubs + synthetic events) for phase-1 testing.
+    # The local proxy is PID 1; it binds loopback :443 and :80, then spawns the
+    # agent. Empty --broker-address runs it standalone (stubs + synthetic events).
     command: ["/local-proxy", "--broker-address=${BROKER_ADDRESS}", "--", "node", "/app/app.js"]
     env:
     - name: SLACK_APP_TOKEN
@@ -114,12 +94,8 @@ spec:
   workerSelector:
     matchLabels:
       workload: ws-poc-echo
-  # onPause: Full checkpoints the whole sandbox — both processes AND their
-  # loopback connection — and warm-restores it with memory intact. This is the
-  # point of the sidecar design: the agent↔proxy socket survives resume, only
-  # the proxy's broker stream reconnects. The agent's Socket Mode client still
-  # reconnects LOCALLY after a restore (its pong-staleness check uses the wall
-  # clock, which jumps); the proxy holds event delivery until that settles.
+  # onPause: Full warm-restores the whole sandbox with memory: the agent<->proxy
+  # loopback socket survives, only the proxy's broker stream reconnects.
   snapshotsConfig:
     onPause: Full
     onCommit: Full

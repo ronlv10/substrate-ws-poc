@@ -1,17 +1,3 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package proxy
 
 import (
@@ -25,8 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/ronlv10/substrate-ws-poc/internal/slackapi"
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
 const (
@@ -34,9 +19,9 @@ const (
 	// synthesized apps.connections.open response points here.
 	WSSPath = "/local/socketmode"
 
-	// agentPingInterval paces proxy→agent WebSocket pings. The stock client
-	// monitors time-since-last-server-ping (real Slack pings continuously),
-	// so silence here would itself trigger a reconnect.
+	// agentPingInterval paces proxy->agent pings. The stock client monitors
+	// time-since-last-server-ping (real Slack pings continuously), so silence
+	// here would itself trigger a reconnect.
 	agentPingInterval = 5 * time.Second
 )
 
@@ -55,14 +40,14 @@ func NewSlackFace(core *Core, wssHost string, log *slog.Logger) *SlackFace {
 
 func (s *SlackFace) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+slackapi.PathConnectionsOpen, s.handleConnectionsOpen)
+	mux.HandleFunc("POST "+slack.PathConnectionsOpen, s.handleConnectionsOpen)
 	mux.HandleFunc("GET "+WSSPath, s.handleSocket)
 	mux.HandleFunc("/", s.handlePassthrough)
 	return mux
 }
 
-// ReadyzHandler serves /readyz on :80: 200 only while the agent is quiescent
-// (see Core.AgentQuiescent for why).
+// ReadyzHandler serves /readyz: 200 only while the agent is quiescent (see
+// Core.AgentQuiescent).
 func (s *SlackFace) ReadyzHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.core.AgentQuiescent() {
@@ -76,7 +61,7 @@ func (s *SlackFace) ReadyzHandler() http.Handler {
 func (s *SlackFace) handleConnectionsOpen(w http.ResponseWriter, r *http.Request) {
 	s.core.SetAppToken(bearerToken(r.Header.Get("Authorization")))
 	s.log.Info("local-proxy: apps.connections.open, pointing agent at loopback")
-	writeJSON(w, slackapi.ConnectionsOpenResponse{OK: true, URL: "wss://" + s.wssHost + WSSPath})
+	writeJSON(w, slack.ConnectionsOpenResponse{OK: true, URL: "wss://" + s.wssHost + WSSPath})
 }
 
 func (s *SlackFace) handleSocket(w http.ResponseWriter, r *http.Request) {
@@ -88,16 +73,15 @@ func (s *SlackFace) handleSocket(w http.ResponseWriter, r *http.Request) {
 	n := s.core.Attach(conn)
 	s.log.Info("local-proxy: agent socket attached", slog.Int("attach", n))
 
-	// First heartbeat ping on this connection = the client is dispatching →
-	// release buffered events. Also answer the ping (gorilla's default pong)
-	// so the client's pong-staleness clock resets.
+	// First heartbeat ping on this connection = the client is dispatching:
+	// release buffered events, and pong so its staleness clock resets.
 	conn.SetPingHandler(func(appData string) error {
 		s.core.MarkReady(conn)
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
 	})
 	conn.SetPongHandler(func(string) error { return nil })
 
-	hello, _ := json.Marshal(socketmode.Envelope{Type: socketmode.TypeHello, NumConnections: 1})
+	hello, _ := json.Marshal(slack.Envelope{Type: slack.TypeHello, NumConnections: 1})
 	if err := conn.WriteMessage(websocket.TextMessage, hello); err != nil {
 		s.log.Warn("local-proxy: sending hello failed", slog.Any("error", err))
 		s.core.Detach(conn)
@@ -108,12 +92,16 @@ func (s *SlackFace) handleSocket(w http.ResponseWriter, r *http.Request) {
 	go s.pingAgent(conn, stop)
 	defer close(stop)
 	defer s.core.Detach(conn)
+	s.readAgentAcks(conn, n)
+}
 
+// readAgentAcks reads the agent's Socket Mode acks until it disconnects.
+func (s *SlackFace) readAgentAcks(conn *websocket.Conn, attach int) {
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			s.log.Info("local-proxy: agent socket read loop ended",
-				slog.Int("attach", n), slog.Any("error", err))
+				slog.Int("attach", attach), slog.Any("error", err))
 			return
 		}
 		if id := decodeAck(raw); id != "" {

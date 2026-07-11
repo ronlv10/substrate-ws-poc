@@ -1,29 +1,15 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Package proxy is the local egress proxy that runs INSIDE the actor image,
+// Package proxy is the local egress proxy that runs inside the actor image,
 // co-resident with the agent. It impersonates Slack for its single loopback
-// client (a stock Bolt Socket Mode app) and relays events and Web API calls
-// to the always-on egress broker.
+// client (a stock Bolt Socket Mode app) and relays events and Web API calls to
+// the always-on egress broker.
 //
-// Delivery contract, established by the phase-0 spikes: the loopback socket
-// survives checkpoint/restore, but the stock Slack client still reconnects
-// after every restore (its pong-staleness check uses the wall clock, which
-// jumps). An event written during that churn window is silently dropped, so
-// the proxy buffers every event until the agent acks it and only writes when
-// the CURRENT connection has proven itself with a heartbeat ping. Undelivered
-// events are re-sent, with their original envelope ids, after each re-attach.
+// Delivery contract: the loopback socket survives checkpoint/restore, but the
+// stock Slack client still reconnects after every restore (its pong-staleness
+// check uses the wall clock, which jumps). An event written during that churn
+// window is silently dropped, so the proxy buffers every event until the agent
+// acks it and only writes once the current connection has proven itself with a
+// heartbeat ping. Unacked events are re-sent, with their original envelope
+// ids, after each re-attach.
 package proxy
 
 import (
@@ -35,7 +21,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/ronlv10/substrate-ws-poc/internal/socketmode"
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
 // EgressResult is the broker's (or standalone stub's) answer to an agent Web
@@ -46,27 +32,24 @@ type EgressResult struct {
 	Body   []byte
 }
 
-// EgressFunc relays an agent Web API request. Implementations: the broker
-// client (relay over the Session stream) or the standalone stub.
+// EgressFunc relays an agent Web API request upstream.
 type EgressFunc func(method, path string, header http.Header, body []byte) (*EgressResult, error)
 
-// Core owns the agent-facing connection state and the undelivered-event
-// buffer. One Core serves exactly one co-resident agent.
+// Core owns the agent-facing connection state and the unacked-event buffer.
+// One Core serves exactly one co-resident agent.
 type Core struct {
 	log    *slog.Logger
 	egress EgressFunc
-	// onAck reports an agent ack upstream (broker Ack{seq}); nil in standalone.
-	onAck func(seq uint64)
+	onAck  func(seq uint64) // reports an agent ack upstream; nil in standalone
 
-	mu             sync.Mutex
-	appToken       string
-	agent          *websocket.Conn
-	agentSeq       int  // attach counter, labels log lines
-	ready          bool // current attach has heartbeated
-	egressInFlight int
-	pending        []pendingEvent
-	seqByID        map[string]uint64
-	maxAcked       uint64
+	mu       sync.Mutex
+	appToken string
+	agent    *websocket.Conn
+	agentSeq int  // attach counter, labels log lines
+	ready    bool // current attach has heartbeated
+	pending  []pendingEvent
+	seqByID  map[string]uint64
+	maxAcked uint64
 }
 
 type pendingEvent struct {
@@ -78,8 +61,7 @@ func NewCore(log *slog.Logger) *Core {
 	return &Core{log: log, seqByID: map[string]uint64{}}
 }
 
-// SetEgress and SetOnAck wire the upstream side (broker client or standalone).
-func (c *Core) SetEgress(f EgressFunc)     { c.egress = f }
+func (c *Core) SetEgress(f EgressFunc)      { c.egress = f }
 func (c *Core) SetOnAck(f func(seq uint64)) { c.onAck = f }
 
 // SetAppToken records the token captured from apps.connections.open.
@@ -98,24 +80,20 @@ func (c *Core) AppToken() string {
 	return c.appToken
 }
 
-// AgentQuiescent reports whether the agent is attached and has heartbeated on
-// the current connection; it drives /readyz. Readiness gates two checkpoints:
-// ResumeActor's wait (so delivery only proceeds once the local reconnect
-// churn has settled) and the golden snapshot (substrate checkpoints as soon
-// as readyz is green). A Node process frozen mid-V8-startup SIGILLs on
-// restore; the first heartbeat only happens well past that. In-flight Web API
-// calls deliberately do NOT block readiness: a retrying client would hold
-// readiness hostage forever (observed with an unreachable broker), and the
-// golden-creation controller suspends on readyz timeouts, making the
-// dependency circular.
+// AgentQuiescent drives /readyz: the agent is attached and has heartbeated on
+// the current connection. Readiness gates checkpoints (the golden snapshot and
+// ResumeActor's wait both fire on it), and a Node process frozen mid-startup
+// SIGILLs on restore — the first heartbeat only happens well past that.
+// In-flight Web API calls deliberately do not block readiness: a retrying
+// client would hold it hostage and deadlock golden-snapshot creation.
 func (c *Core) AgentQuiescent() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.agent != nil && c.ready
 }
 
-// LastContiguousAcked is the resume point for the broker Announce: every
-// event with seq <= this value has been acked by the agent.
+// LastContiguousAcked is the resume point for the broker Announce: every event
+// with seq <= this value has been acked by the agent.
 func (c *Core) LastContiguousAcked() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -125,10 +103,10 @@ func (c *Core) LastContiguousAcked() uint64 {
 	return c.maxAcked
 }
 
-// Deliver buffers one event (raw Socket Mode envelope, original envelope_id)
-// and writes it immediately if the current agent connection is heartbeat-ready.
+// Deliver buffers one event (raw Socket Mode envelope) and writes it
+// immediately if the current agent connection is heartbeat-ready.
 func (c *Core) Deliver(seq uint64, raw []byte) error {
-	env, err := socketmode.DecodeEnvelope(raw)
+	env, err := slack.DecodeEnvelope(raw)
 	if err != nil {
 		return fmt.Errorf("local-proxy: undeliverable event seq=%d: %w", seq, err)
 	}
@@ -144,14 +122,13 @@ func (c *Core) Deliver(seq uint64, raw []byte) error {
 	return nil
 }
 
-// Attach installs a freshly upgraded agent connection. Delivery stays held
-// until MarkReady (the first heartbeat ping on THIS connection).
+// Attach installs a freshly upgraded agent connection; delivery stays held
+// until MarkReady.
 func (c *Core) Attach(conn *websocket.Conn) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.agent != nil {
-		// The stock client reconnects after every restore; the replaced
-		// connection is the dead-to-it survivor. Expected, not an error.
+		// Expected: the stock client reconnects after every restore.
 		c.log.Info("local-proxy: agent reconnected, replacing previous connection")
 		_ = c.agent.Close()
 	}
@@ -161,7 +138,7 @@ func (c *Core) Attach(conn *websocket.Conn) int {
 	return c.agentSeq
 }
 
-// Detach clears conn if it is still current (read loop ended).
+// Detach clears conn if it is still current.
 func (c *Core) Detach(conn *websocket.Conn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -172,9 +149,8 @@ func (c *Core) Detach(conn *websocket.Conn) {
 }
 
 // MarkReady flushes the buffer on the first heartbeat of the given attach.
-// Bolt reaches connected:ready and starts heartbeating only after it is
-// dispatching; anything written earlier can land in the churn window and be
-// silently dropped (observed in the phase-0 spike).
+// Bolt starts heartbeating only once it is dispatching; anything written
+// earlier can land in the reconnect churn and be silently dropped.
 func (c *Core) MarkReady(conn *websocket.Conn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -194,8 +170,7 @@ func (c *Core) MarkReady(conn *websocket.Conn) {
 	}
 }
 
-// OnAgentAck consumes an ack frame from the agent: drop the buffered event
-// and report it upstream.
+// OnAgentAck drops the buffered event and reports it upstream.
 func (c *Core) OnAgentAck(envelopeID string) {
 	c.mu.Lock()
 	seq, ok := c.seqByID[envelopeID]
@@ -223,26 +198,17 @@ func (c *Core) OnAgentAck(envelopeID string) {
 	}
 }
 
-// Egress relays an agent Web API call via the configured upstream. The
-// in-flight window blocks readiness (see AgentQuiescent).
+// Egress relays an agent Web API call via the configured upstream.
 func (c *Core) Egress(method, path string, header http.Header, body []byte) (*EgressResult, error) {
 	if c.egress == nil {
 		return nil, fmt.Errorf("local-proxy: no egress path configured")
 	}
-	c.mu.Lock()
-	c.egressInFlight++
-	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		c.egressInFlight--
-		c.mu.Unlock()
-	}()
 	return c.egress(method, path, header, body)
 }
 
-// writeLocked writes one frame to the agent; callers hold c.mu (which also
-// serializes writers, satisfying gorilla's one-writer rule; control frames
-// use WriteControl, which is safe concurrently).
+// writeLocked writes one frame to the agent. Callers hold c.mu, which also
+// serializes writers (gorilla permits one at a time; control frames use
+// WriteControl, which is concurrency-safe).
 func (c *Core) writeLocked(conn *websocket.Conn, raw []byte, seq uint64) error {
 	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 		return err
@@ -251,8 +217,7 @@ func (c *Core) writeLocked(conn *websocket.Conn, raw []byte, seq uint64) error {
 	return nil
 }
 
-// decodeAck extracts the envelope_id from an agent frame; non-ack frames
-// (empty id) are ignored by the caller.
+// decodeAck extracts the envelope_id from an agent frame; non-ack frames yield "".
 func decodeAck(raw []byte) string {
 	var a struct {
 		EnvelopeID string `json:"envelope_id"`

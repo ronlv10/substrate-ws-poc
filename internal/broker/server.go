@@ -1,18 +1,4 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-package main
+package broker
 
 import (
 	"fmt"
@@ -25,32 +11,32 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 	brokerproxypb "github.com/ronlv10/substrate-ws-poc/proto/brokerproxy/v1"
 )
 
 // goldenAtespace is where substrate instantiates the golden-snapshot template
 // actor. Its proxy announces like any other, but it must never get a Slack
-// session: the golden actor is a throwaway whose identity every derived actor
-// briefly wears, and a Slack connection keyed to it would sit on the app token.
+// session: every derived actor briefly wears this identity.
 const goldenAtespace = "ate-golden"
 
-// GRPCServer is the broker's proxy-facing endpoint: one Session stream per
-// local proxy. Identity of record is the stream's first frame (Announce) — no
-// source-IP correlation, no tickets, no TLS MITM.
-type GRPCServer struct {
+// Server is the proxy-facing gRPC endpoint: one Session stream per local proxy.
+// Identity of record is the stream's first frame (Announce).
+type Server struct {
 	brokerproxypb.UnimplementedBrokerProxyServer
-	reg     *Registry
-	forward *realSlackDialer
-	log     *slog.Logger
+	reg        *Registry
+	httpClient *http.Client
+	apiBase    string
+	log        *slog.Logger
 }
 
-func NewGRPCServer(reg *Registry, forward *realSlackDialer, log *slog.Logger) *GRPCServer {
-	return &GRPCServer{reg: reg, forward: forward, log: log}
+func NewServer(reg *Registry, dialer *slack.Dialer, log *slog.Logger) *Server {
+	return &Server{reg: reg, httpClient: dialer.HTTPClient(), apiBase: dialer.APIBaseURL(), log: log}
 }
 
-// grpcSink adapts a Session stream to the session's eventSink. sendMu
-// serializes all Send calls (events and egress responses come from different
-// goroutines; gRPC allows one concurrent sender per stream).
+// grpcSink adapts a Session stream to eventSink. sendMu serializes Send calls
+// (events and egress responses come from different goroutines; gRPC allows one
+// concurrent sender per stream).
 type grpcSink struct {
 	stream brokerproxypb.BrokerProxy_SessionServer
 	sendMu sync.Mutex
@@ -69,9 +55,9 @@ func (g *grpcSink) send(msg *brokerproxypb.BrokerMsg) error {
 }
 
 // Session handles one proxy connection for its whole lifetime. The stream
-// ending (the actor was suspended, or crashed) detaches the sink; buffered
-// events wait for the next Announce.
-func (s *GRPCServer) Session(stream brokerproxypb.BrokerProxy_SessionServer) error {
+// ending (actor suspended, or crashed) detaches the sink; buffered events wait
+// for the next Announce.
+func (s *Server) Session(stream brokerproxypb.BrokerProxy_SessionServer) error {
 	first, err := stream.Recv()
 	if err != nil {
 		return err
@@ -84,9 +70,8 @@ func (s *GRPCServer) Session(stream brokerproxypb.BrokerProxy_SessionServer) err
 		return status.Error(codes.InvalidArgument, "Announce missing actor identity")
 	}
 
-	// The golden template actor: accept and idle the stream (so the template
-	// boots and checkpoints cleanly) but never start a Slack session under its
-	// identity.
+	// Hold the golden template's stream open (so the template boots and
+	// checkpoints cleanly) but never start a Slack session under its identity.
 	if announce.Atespace == goldenAtespace {
 		s.log.Info("egress-broker: golden template proxy announced; holding stream without a Slack session",
 			slog.String("actor", announce.Atespace+"/"+announce.Name))
@@ -130,9 +115,8 @@ func (s *GRPCServer) Session(stream brokerproxypb.BrokerProxy_SessionServer) err
 }
 
 // relayEgress forwards one agent Web API call to real Slack and returns the
-// response over the stream. beginForward/endForward hold off idle suspend
-// while the call is in flight.
-func (s *GRPCServer) relayEgress(sess *session, sink *grpcSink, e *brokerproxypb.Egress) {
+// response over the stream; idle suspend holds off while it is in flight.
+func (s *Server) relayEgress(sess *session, sink *grpcSink, e *brokerproxypb.Egress) {
 	sess.beginForward()
 	defer sess.endForward()
 
@@ -142,12 +126,11 @@ func (s *GRPCServer) relayEgress(sess *session, sink *grpcSink, e *brokerproxypb
 	}
 }
 
-func (s *GRPCServer) doEgress(e *brokerproxypb.Egress) *brokerproxypb.EgressResp {
+func (s *Server) doEgress(e *brokerproxypb.Egress) *brokerproxypb.EgressResp {
 	fail := func(code int, msg string) *brokerproxypb.EgressResp {
 		return &brokerproxypb.EgressResp{CorrId: e.CorrId, Status: int32(code), Body: []byte(msg)}
 	}
-	target := s.forward.apiBaseURL + e.Path
-	req, err := http.NewRequest(e.Method, target, strings.NewReader(string(e.Body)))
+	req, err := http.NewRequest(e.Method, s.apiBase+e.Path, strings.NewReader(string(e.Body)))
 	if err != nil {
 		return fail(http.StatusBadGateway, fmt.Sprintf("building request: %v", err))
 	}
@@ -157,9 +140,8 @@ func (s *GRPCServer) doEgress(e *brokerproxypb.Egress) *brokerproxypb.EgressResp
 		}
 	}
 	req.Header.Del("Accept-Encoding") // let Go negotiate; avoids double-encoding
-	req.Host = "slack.com"
 
-	resp, err := s.forward.httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fail(http.StatusBadGateway, fmt.Sprintf("forwarding to Slack: %v", err))
 	}

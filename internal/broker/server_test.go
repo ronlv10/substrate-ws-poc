@@ -1,18 +1,4 @@
-// Copyright 2026 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-package main
+package broker
 
 import (
 	"context"
@@ -33,8 +19,8 @@ import (
 	brokerproxypb "github.com/ronlv10/substrate-ws-poc/proto/brokerproxy/v1"
 )
 
-// dialSession starts the GRPCServer over bufconn and opens one Session stream.
-func dialSession(t *testing.T, srv *GRPCServer) brokerproxypb.BrokerProxy_SessionClient {
+// dialSession serves srv over bufconn and opens one Session stream.
+func dialSession(t *testing.T, srv *Server) brokerproxypb.BrokerProxy_SessionClient {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
@@ -67,19 +53,30 @@ func announce(t *testing.T, stream brokerproxypb.BrokerProxy_SessionClient, ates
 	}
 }
 
-func newTestGRPCServer(t *testing.T, slackAPIBase string) (*GRPCServer, *fakeSlackConn, *fakeResumer) {
+// newTestServer wires a Server whose sessions read from a fake Slack conn and
+// whose egress forwards to apiBase.
+func newTestServer(t *testing.T, apiBase string) (*Server, *fakeSlackConn, *fakeResumer) {
 	t.Helper()
 	conn := newFakeSlackConn()
 	resumer := &fakeResumer{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := NewRegistry(resumer, &fakeSuspender{}, &fakeDialer{conn: conn}, 0, log)
-	forward := newRealSlackDialer("8.8.8.8:53", slackAPIBase)
-	t.Cleanup(func() { close(conn.frames) })
-	return NewGRPCServer(reg, forward, log), conn, resumer
+	reg := NewRegistry(resumer, &fakeSuspender{}, nil, 0, log)
+	srv := &Server{reg: reg, httpClient: http.DefaultClient, apiBase: apiBase, log: log}
+
+	// Pre-create the session and drive its read loop from the fake conn, so
+	// EnsureStarted (which would dial real Slack) finds it already started.
+	sess := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
+	sess.mu.Lock()
+	sess.stop = make(chan struct{})
+	stop := sess.stop
+	sess.mu.Unlock()
+	go sess.readSlackUntilClose(conn, stop)
+	t.Cleanup(func() { close(stop); close(conn.frames) })
+	return srv, conn, resumer
 }
 
 func TestSessionAnnounceEventAckRoundTrip(t *testing.T) {
-	srv, slackConn, _ := newTestGRPCServer(t, "https://slack.com")
+	srv, slackConn, _ := newTestServer(t, "https://slack.com")
 	stream := dialSession(t, srv)
 	announce(t, stream, "demo", "echo-1", 0)
 
@@ -99,7 +96,6 @@ func TestSessionAnnounceEventAckRoundTrip(t *testing.T) {
 		t.Fatalf("payload should be the original envelope: %s (err=%v)", ev.Payload, err)
 	}
 
-	// Ack drops it from the buffer: a re-announce on a new stream gets nothing.
 	stream.Send(&brokerproxypb.ProxyMsg{Msg: &brokerproxypb.ProxyMsg_Ack{Ack: &brokerproxypb.Ack{Seq: 1}}})
 	waitFor(t, "buffer drain", func() bool {
 		s := srv.reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
@@ -110,7 +106,7 @@ func TestSessionAnnounceEventAckRoundTrip(t *testing.T) {
 }
 
 func TestSessionResendsUnackedAfterReconnect(t *testing.T) {
-	srv, slackConn, _ := newTestGRPCServer(t, "https://slack.com")
+	srv, slackConn, _ := newTestServer(t, "https://slack.com")
 	stream1 := dialSession(t, srv)
 	announce(t, stream1, "demo", "echo-1", 0)
 
@@ -136,7 +132,7 @@ func TestSessionResendsUnackedAfterReconnect(t *testing.T) {
 }
 
 func TestSessionRejectsMissingAnnounce(t *testing.T) {
-	srv, _, _ := newTestGRPCServer(t, "https://slack.com")
+	srv, _, _ := newTestServer(t, "https://slack.com")
 	stream := dialSession(t, srv)
 	stream.Send(&brokerproxypb.ProxyMsg{Msg: &brokerproxypb.ProxyMsg_Ack{Ack: &brokerproxypb.Ack{Seq: 1}}})
 	if _, err := stream.Recv(); err == nil {
@@ -145,21 +141,20 @@ func TestSessionRejectsMissingAnnounce(t *testing.T) {
 }
 
 func TestGoldenAnnounceGetsNoSlackSession(t *testing.T) {
-	srv, _, resumer := newTestGRPCServer(t, "https://slack.com")
+	srv, _, resumer := newTestServer(t, "https://slack.com")
 	stream := dialSession(t, srv)
 	announce(t, stream, "ate-golden", "some-uuid", 0)
 
 	time.Sleep(100 * time.Millisecond)
 	srv.reg.mu.Lock()
-	sessions := len(srv.reg.sessions)
+	_, exists := srv.reg.sessions[ActorRef{Atespace: "ate-golden", Name: "some-uuid"}]
 	srv.reg.mu.Unlock()
-	if sessions != 0 || resumer.resumes() != 0 {
-		t.Fatalf("golden announce created state: sessions=%d resumes=%d", sessions, resumer.resumes())
+	if exists || resumer.resumes() != 0 {
+		t.Fatalf("golden announce created state: session=%v resumes=%d", exists, resumer.resumes())
 	}
 }
 
 func TestEgressRelayRoundTrip(t *testing.T) {
-	// A fake "real Slack" HTTP endpoint.
 	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/chat.postMessage" {
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -170,7 +165,7 @@ func TestEgressRelayRoundTrip(t *testing.T) {
 	}))
 	defer slack.Close()
 
-	srv, _, _ := newTestGRPCServer(t, slack.URL)
+	srv, _, _ := newTestServer(t, slack.URL)
 	stream := dialSession(t, srv)
 	announce(t, stream, "demo", "echo-1", 0)
 

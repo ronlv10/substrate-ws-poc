@@ -46,12 +46,12 @@ lc=$(grep -cE 'child_process|execFile|spawn|SuspendActor|ResumeActor|CheckpointW
 echo
 echo "     lifecycle/exec/gRPC calls in the actor:  ${BOLD}${GRN}${lc} matches${RESET}"
 echo "     ${DIM}→ no child_process, no gRPC, no SuspendActor/ResumeActor. It CANNOT${RESET}"
-echo "     ${DIM}  suspend or resume itself. Its only substrate touch is reading its${RESET}"
-echo "     ${DIM}  own id from /run/ate to send as a header.${RESET}"
+echo "     ${DIM}  suspend or resume itself, and has no substrate awareness — the${RESET}"
+echo "     ${DIM}  co-resident local proxy owns identity and lifecycle.${RESET}"
 echo
-echo "${BOLD}  2) The lifecycle lives in the broker — proof from its source${RESET}  ${DIM}(cmd/egress-broker)${RESET}"
-sus=$(grep -rhoE 'SuspendActor' "$REPO/cmd/egress-broker/" 2>/dev/null | wc -l | tr -d ' ')
-res=$(grep -rhoE 'ResumeActor'  "$REPO/cmd/egress-broker/" 2>/dev/null | wc -l | tr -d ' ')
+echo "${BOLD}  2) The lifecycle lives in the broker — proof from its source${RESET}  ${DIM}(internal/broker)${RESET}"
+sus=$(grep -rhoE 'SuspendActor' "$REPO/internal/broker/" 2>/dev/null | wc -l | tr -d ' ')
+res=$(grep -rhoE 'ResumeActor'  "$REPO/internal/broker/" 2>/dev/null | wc -l | tr -d ' ')
 echo
 echo "     broker references to ${BOLD}SuspendActor${RESET}: ${CYN}${sus}${RESET}   ${BOLD}ResumeActor${RESET}: ${CYN}${res}${RESET}"
 echo "     ${DIM}→ the always-on broker is what checkpoints and wakes the actor.${RESET}"
@@ -93,20 +93,18 @@ for raw in sys.stdin:
             emit("[BROKER]", CYN, t, "Slack sent a message on the persistent connection", CYN)
         elif "resuming suspended actor" in m:
             emit("[BROKER]", CYN, t, "→ calls ResumeActor(demo/echo-1) on the substrate control plane", BOLD+CYN)
-        elif "connection established; delivering" in m:
-            emit("[BROKER]", CYN, t, "delivers the buffered event to the actor")
-        elif "forwarded Slack API call" in m and "chat.postMessage" in p:
-            emit("[BROKER]", CYN, t, f"forwards the actor's echo to real Slack ({st})")
+        elif "proxy announced" in m:
+            emit("[BROKER]", CYN, t, "the resumed actor's proxy reconnects and re-announces")
+        elif "proxy acked event" in m:
+            emit("[BROKER]", CYN, t, "the actor handled the event (proxy acked)")
         elif "idle; suspending from broker" in m:
             emit("[BROKER]", CYN, t, "→ calls SuspendActor(demo/echo-1) — checkpoints it from OUTSIDE", BOLD+CYN)
     else:  # actor
-        # actor logs are the echo-actor's stderr + Bolt's socket-mode logs
-        if "echo-actor: starting Socket Mode" in m:
-            emit("[ACTOR]", GRN, t, "boots and starts its Slack Socket Mode client")
+        # actor logs are the proxy, the echo-actor's stderr, and Bolt's socket-mode logs
+        if "event delivered to agent" in m:
+            emit("[ACTOR]", GRN, t, "proxy delivers the buffered event to the agent over loopback")
         elif "Bolt app is running" in m:
             emit("[ACTOR]", GRN, t, "Bolt app running")
-        elif "Now connected to Slack" in m:
-            emit("[ACTOR]", GRN, t, "connected to \"slack.com\" (actually the broker)")
         elif "handling app_mention" in m or "handling message" in m:
             emit("[ACTOR]", GRN, t, "handles the @-mention and composes a reply", BOLD+GRN)
         elif "reply posted" in m:
