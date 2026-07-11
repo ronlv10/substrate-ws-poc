@@ -97,22 +97,7 @@ mount — deterministic, with no source-IP race after a resume.
 Slack `hello` / `disconnect` frames and WebSocket ping/pong are **never**
 delivered and never wake the actor.
 
-## Transparent redirect and CA trust (PoC mechanisms)
-
-- **Redirect — per-actor `/etc/hosts`.** The actor's `entrypoint.sh` resolves the
-  broker Service (`BROKER_SERVICE`, a stable ClusterIP) and appends
-  `<ip> slack.com wss-primary.slack.com` to its own `/etc/hosts` before starting
-  Bolt. `slack.com` stays the TLS SNI, so the broker's cert still matches. The
-  redirect lives only in the actor, so the broker is never caught by it and cluster
-  DNS is untouched — no upstream-resolver workaround, no blast radius.
-- **Cert trust — node bundle mounted into actors.** `certs/gen-ca.sh` produces the
-  broker's self-signed certificate (with `slack.com` / `wss-primary.slack.com`
-  SANs) once, at deploy. The `ca-installer` DaemonSet publishes `system CAs +
-  broker cert` to the shared ateom hostPath on every node, and atelet is pointed
-  at it via the `ATE_ACTOR_CA_BUNDLE` env var; atelet then bind-mounts it into
-  every actor sandbox over `/etc/ssl/certs/ca-certificates.crt`.
-
-### The substrate changes (in the fork)
+## The substrate changes (in the fork)
 
 The substrate-side changes live on the **`ws-poc` branch of the substrate fork**:
 <https://github.com/ronlv10/substrate/tree/ws-poc>. Both are additive and opt-in
@@ -191,18 +176,3 @@ make test        # go test ./...
 Unit tests cover Socket Mode envelope classification (keepalive vs. real event),
 the event buffer + immediate Slack-ack, keepalive filtering, resume
 orchestration, and per-actor session keying — using fakes, no cluster required.
-
-## Production hardening (documented, not built)
-
-- **Per-workload transparent capture.** The `/etc/hosts` redirect only catches
-  hostname egress; production would use in-pod `nftables` TPROXY/DNAT egress
-  capture in `cmd/ateom-gvisor/main.go` (`installActorNftablesRules`) and
-  `cmd/ateom-microvm/net.go`, scoped to opted-in actors. That also catches
-  IP-literal egress.
-- **Centrally managed CA**, gated per ActorTemplate rather than cluster-wide.
-- **Multi-tenant Socket Mode.** The broker forwards HTTPS for any actor but only
-  brokers Socket Mode for identified WS-PoC actors; full per-app Socket Mode
-  multiplexing (so unrelated Slack apps coexist) is the next extension.
-- **Durable buffer / HA.** The event buffer and captured tokens are in-memory; a
-  broker restart loses them until an actor reconnects. Production would persist
-  them and run the broker HA.
