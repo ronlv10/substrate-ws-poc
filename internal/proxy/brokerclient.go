@@ -35,6 +35,7 @@ type BrokerClient struct {
 	cancel   context.CancelFunc
 	corrID   uint64
 	inflight map[uint64]chan *brokerproxypb.EgressResp
+	wake     chan struct{} // restore detector pokes this to cut short a backoff sleep
 }
 
 func NewBrokerClient(core *Core, addr, identityDir string, log *slog.Logger) *BrokerClient {
@@ -44,6 +45,7 @@ func NewBrokerClient(core *Core, addr, identityDir string, log *slog.Logger) *Br
 		identityDir: identityDir,
 		log:         log,
 		inflight:    map[uint64]chan *brokerproxypb.EgressResp{},
+		wake:        make(chan struct{}, 1),
 	}
 	core.SetEgress(bc.egress)
 	core.SetOnAck(bc.sendAck)
@@ -72,13 +74,25 @@ func (bc *BrokerClient) Run() {
 		err := bc.session(client)
 		bc.log.Info("local-proxy: broker session ended, reconnecting",
 			slog.Any("error", err), slog.Duration("backoff", backoff))
-		time.Sleep(backoff)
+		backoff = bc.waitBeforeReconnect(backoff)
+	}
+}
+
+// waitBeforeReconnect blocks until the next reconnect should happen and returns
+// the backoff for the following wait. A wake — the restore detector flagging a
+// checkpoint/restore — reconnects immediately and resets the backoff, so a
+// resume never waits out a backoff inflated by pre-suspend failures. Otherwise
+// it sleeps the current backoff and grows it (capped), the ordinary path for a
+// genuine broker outage.
+func (bc *BrokerClient) waitBeforeReconnect(backoff time.Duration) time.Duration {
+	select {
+	case <-bc.wake:
+		return time.Second
+	case <-time.After(backoff):
 		if backoff *= 2; backoff > 30*time.Second {
 			backoff = 30 * time.Second
 		}
-		if err == nil || strings.Contains(err.Error(), "context canceled") {
-			backoff = time.Second // deliberate redial (restore), not a broker problem
-		}
+		return backoff
 	}
 }
 
@@ -149,15 +163,20 @@ func (bc *BrokerClient) session(client brokerproxypb.BrokerProxyClient) error {
 	}
 }
 
-// Redial tears down the current stream so Run reconnects immediately. Called
-// on restore detection: the old stream's peer state is gone and waiting for
-// keepalive to notice costs the whole wake latency.
+// Redial tears down the current stream and wakes the reconnect loop so it
+// reconnects immediately. Called on restore detection: the old stream's peer
+// state is gone, and both waiting for keepalive to notice and sitting out a
+// stale backoff cost the whole wake latency.
 func (bc *BrokerClient) Redial() {
 	bc.mu.Lock()
 	cancel := bc.cancel
 	bc.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	select {
+	case bc.wake <- struct{}{}: // non-blocking: cut short a backoff sleep
+	default:
 	}
 }
 
