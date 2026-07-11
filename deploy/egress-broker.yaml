@@ -64,9 +64,9 @@ spec:
   selector:
     app: egress-broker
   ports:
-  # Actors dial slack.com:443 (and wss over 443); cluster DNS points those
-  # hostnames here, and this Service forwards 443 to the broker's 8443 so the
-  # broker need not run privileged.
+  # Actors dial slack.com:443 (and wss over 443); their /etc/hosts points those
+  # hostnames here, and this Service forwards 443 to 8443 so the broker need not
+  # run privileged.
   - name: https
     port: 443
     targetPort: 8443

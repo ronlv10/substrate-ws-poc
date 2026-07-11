@@ -1,4 +1,7 @@
-package main
+// Package broker is the egress broker runtime: it terminates the actor's TLS to
+// Slack, holds each actor's persistent Slack connection across suspend/resume,
+// resumes the actor on an inbound event, and suspends it again when idle.
+package broker
 
 import (
 	"context"
@@ -12,15 +15,12 @@ import (
 	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 )
 
-// actorSink is the broker's write side of the actor-facing Socket Mode
-// WebSocket. It is an interface so the session's buffering/delivery logic can be
-// unit-tested without a real WebSocket.
+// actorSink is the write side of the actor-facing Socket Mode WebSocket, an
+// interface so delivery can be tested without a real socket.
 type actorSink interface {
-	// WriteFrame sends one raw Socket Mode frame to the actor.
 	WriteFrame(b []byte) error
 }
 
-// helloFrame is the constant hello a Slack Socket Mode server sends on connect.
 var helloFrame = mustJSON(slack.Envelope{Type: slack.TypeHello, NumConnections: 1})
 
 func mustJSON(v any) []byte {
@@ -31,27 +31,21 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// Registry owns one session per actor. A session holds that actor's persistent
-// Slack connection, its captured token, and its event buffer, keyed by
-// ActorRef — so each Slack connection maps to exactly one actor and inbound
-// events route unambiguously.
+// Registry owns one session per actor, keyed by ActorRef.
 type Registry struct {
 	resumer   Resumer
 	suspender Suspender
 	dialer    *slack.Dialer
 	log       *slog.Logger
 
-	// idleGrace is how long the actor's broker-facing connection may be quiet in
-	// both directions (no delivered event, no ack, no forwarded API call;
-	// keepalive pings excluded) before the broker suspends it. Zero disables
-	// broker-driven suspend.
+	// idleGrace bounds how long the actor's connection may be quiet (excluding
+	// keepalives) before the broker suspends it; zero disables broker-driven suspend.
 	idleGrace time.Duration
 
 	mu       sync.Mutex
 	sessions map[ActorRef]*session
 }
 
-// NewRegistry builds a Registry.
 func NewRegistry(resumer Resumer, suspender Suspender, dialer *slack.Dialer, idleGrace time.Duration, log *slog.Logger) *Registry {
 	if log == nil {
 		log = slog.Default()
@@ -66,25 +60,24 @@ func NewRegistry(resumer Resumer, suspender Suspender, dialer *slack.Dialer, idl
 	}
 }
 
-// GetOrCreate returns the session for ref, creating it if necessary.
 func (r *Registry) GetOrCreate(ref ActorRef) *session {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	s, ok := r.sessions[ref]
 	if !ok {
 		s = &session{ref: ref, reg: r, freshIDs: make(map[string]uint64)}
 		r.sessions[ref] = s
 	}
+	r.mu.Unlock()
 	return s
 }
 
-// Lookup returns the existing session for ref, or nil if none exists (unlike
-// GetOrCreate it never creates one — used by the passthrough to touch a session
-// only if the actor is actually connected).
+// Lookup returns the existing session for ref, or nil — used by the passthrough
+// to touch a session only when the actor is connected.
 func (r *Registry) Lookup(ref ActorRef) *session {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.sessions[ref]
+	s := r.sessions[ref]
+	r.mu.Unlock()
+	return s
 }
 
 // session coordinates one actor's Slack connection and message delivery.
@@ -94,32 +87,23 @@ type session struct {
 
 	mu       sync.Mutex
 	appToken string
-	started  bool
 	closed   bool
-	stop     chan struct{}
+	stop     chan struct{} // non-nil once the persistent Slack loop is started
 
-	sink     actorSink         // current actor-facing connection; nil when suspended/disconnected
-	resuming bool              // a resume is in flight (or the actor is booting) — don't trigger another
+	sink     actorSink         // current actor connection; nil when suspended/disconnected
+	resuming bool              // a resume is in flight; don't trigger another
 	buffer   []pendingEvent    // events awaiting the actor's ack; redelivered on every (re)connect
 	nextKey  uint64            // per-event internal key generator
-	freshIDs map[string]uint64 // freshly minted actor-facing envelope_id -> event key
+	freshIDs map[string]uint64 // per-delivery envelope_id -> event key
 	settled  bool              // true once the actor's connection has signaled ready
 
-	// Broker-driven idle suspend. idleTmr fires idleGrace after the last activity
-	// (delivery, ack, or forwarded API call) and suspends the actor from outside.
-	// inFlight counts outstanding actor->Slack forwards (chat.postMessage) so we
-	// never suspend mid-send; suspending guards against a double suspend.
 	idleTmr    *time.Timer
-	inFlight   int
+	inFlight   int // outstanding actor->Slack forwards; never suspend mid-send
 	suspending bool
 
-	// sinkWrite serializes writes to sink (gorilla permits one writer at a time).
-	sinkWrite sync.Mutex
+	sinkWrite sync.Mutex // gorilla permits one writer at a time
 }
 
-// noteActivity resets the idle-suspend timer. Called on every real actor<->broker
-// exchange (event delivered, ack received, API call forwarded) — but NOT on
-// keepalive pings, so a quiet-but-connected actor still ages out and suspends.
 func (s *session) noteActivity() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,8 +111,7 @@ func (s *session) noteActivity() {
 }
 
 // armIdleLocked (re)arms the idle timer unless the actor is disconnected, a
-// suspend is already in flight, a forward is in flight, or idle suspend is off.
-// Caller holds mu.
+// suspend or forward is in flight, or idle suspend is off. Caller holds mu.
 func (s *session) armIdleLocked() {
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
@@ -140,7 +123,6 @@ func (s *session) armIdleLocked() {
 	s.idleTmr = time.AfterFunc(s.reg.idleGrace, s.onIdle)
 }
 
-// onIdle suspends the actor after idleGrace of no activity, from the OUTSIDE.
 func (s *session) onIdle() {
 	s.mu.Lock()
 	if s.sink == nil || s.suspending || s.inFlight > 0 {
@@ -165,50 +147,44 @@ func (s *session) onIdle() {
 	}
 }
 
-// beginForward marks an actor->Slack forward in progress (chat.postMessage), so
-// idle suspend holds off until it completes. endForward re-arms.
+// beginForward/endForward bracket an actor->Slack forward so idle suspend holds
+// off until it completes.
 func (s *session) beginForward() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.inFlight++
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
 		s.idleTmr = nil
 	}
-	s.mu.Unlock()
 }
 func (s *session) endForward() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
 	s.armIdleLocked()
-	s.mu.Unlock()
 }
 
-// pendingEvent is a Slack event held until the actor acknowledges it. It is kept
-// (not dropped on write) so it survives a client that opens several connections
-// or reconnects mid-startup (e.g. Bolt): the event is redelivered on each
-// attach and only removed once the actor acks it.
-//
-// key is an internal id. Each delivery stamps a FRESH actor-facing envelope_id
-// (mapped back to key via session.freshIDs) so that a client which dedupes by
-// envelope_id — Bolt does — does not silently drop a redelivery as a duplicate.
-// The actor de-dupes echoes by the Slack message ts instead.
+// pendingEvent is a Slack event held until the actor acks it, so it survives a
+// client that reconnects mid-startup (Bolt). Each delivery stamps a fresh
+// envelope_id so a client that dedupes by it (Bolt) does not drop a redelivery;
+// the actor de-dupes echoes by Slack message ts instead.
 type pendingEvent struct {
 	key uint64
-	raw []byte // original Slack envelope (its envelope_id is rewritten per delivery)
+	raw []byte
 }
 
-// EnsureStarted records the app-level token and, on first call, starts the
-// persistent Slack read loop. Called from the actor's apps.connections.open.
+// EnsureStarted records the app token and, on first call, starts the persistent
+// Slack read loop.
 func (s *session) EnsureStarted(appToken string) {
 	s.mu.Lock()
 	s.appToken = appToken
-	if s.started || s.closed {
+	if s.stop != nil || s.closed {
 		s.mu.Unlock()
 		return
 	}
-	s.started = true
 	s.stop = make(chan struct{})
 	stop := s.stop
 	s.mu.Unlock()
@@ -216,9 +192,8 @@ func (s *session) EnsureStarted(appToken string) {
 	go s.runSlack(stop)
 }
 
-// runSlack maintains the persistent Slack Socket Mode connection: it (re)dials,
-// reads envelopes, filters connection-management traffic, acks real events to
-// Slack immediately, and hands them to the session for delivery.
+// runSlack maintains the persistent Slack connection: (re)dial, read, ack real
+// events to Slack, and hand them to the session.
 func (s *session) runSlack(stop <-chan struct{}) {
 	backoff := time.Second
 	for {
@@ -232,9 +207,7 @@ func (s *session) runSlack(stop <-chan struct{}) {
 		token := s.appToken
 		s.mu.Unlock()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		conn, err := s.reg.dialer.Dial(ctx, token)
-		cancel()
+		conn, err := s.reg.dialer.Dial(token)
 		if err != nil {
 			s.reg.log.Warn("egress-broker: dialing Slack failed; will retry",
 				slog.String("actor", s.ref.String()), slog.Any("err", err))
@@ -258,7 +231,6 @@ func (s *session) runSlack(stop <-chan struct{}) {
 	}
 }
 
-// readSlackUntilClose reads envelopes until the connection errors or stop fires.
 func (s *session) readSlackUntilClose(conn slack.Conn, stop <-chan struct{}) {
 	for {
 		select {
@@ -276,29 +248,35 @@ func (s *session) readSlackUntilClose(conn slack.Conn, stop <-chan struct{}) {
 
 		switch {
 		case env.Type == slack.TypeHello || env.Type == slack.TypeDisconnect:
-			// hello / disconnect: lifecycle traffic that must never wake the
-			// actor. slack-go reconnects on its own, so just drop it.
+			// Lifecycle traffic that must never wake the actor; slack-go reconnects.
 			s.reg.log.Debug("egress-broker: ignoring Slack connection-management frame",
 				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
 		case env.Type == slack.TypeEventsAPI:
-			// Ack to Slack immediately (within the ~3s window) so it is not
-			// redelivered, then buffer + deliver to the actor.
+			// This PoC bridges only events_api. Other payload-bearing Socket Mode
+			// frames (slash_commands, interactive) would be handled the same way but
+			// fall through to default below, since the echo bot doesn't use them.
+			//
+			// Buffer first, then ack: only tell Slack we have the event once it is
+			// captured. Buffering is a fast in-memory append (resuming the actor is
+			// async), so we still ack well within Slack's ~3s redelivery window.
+			s.reg.log.Info("egress-broker: real Slack event received; delivering to actor",
+				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
+			s.onEvent(raw)
 			if err := conn.Ack(env.EnvelopeID); err != nil {
 				s.reg.log.Warn("egress-broker: acking Slack event failed",
 					slog.String("actor", s.ref.String()), slog.Any("err", err))
 			}
-			s.reg.log.Info("egress-broker: real Slack event received; delivering to actor",
-				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
-			s.onEvent(raw)
 		default:
-			s.reg.log.Debug("egress-broker: unrecognized Slack frame, ignoring",
+			// Connection noise (connecting, errors) and unsupported payload types
+			// (slash_commands, interactive — out of scope for this PoC).
+			s.reg.log.Debug("egress-broker: ignoring Slack frame",
 				slog.String("actor", s.ref.String()), slog.String("type", env.Type))
 		}
 	}
 }
 
-// onEvent buffers a real event and delivers it to the actor, resuming the actor
-// first if it is suspended. The event stays buffered until the actor acks it.
+// onEvent buffers a real event and delivers it, resuming the actor first if it
+// is suspended. The event stays buffered until acked.
 func (s *session) onEvent(raw []byte) {
 	frame := append([]byte(nil), raw...) // copy: gorilla reuses read buffers
 
@@ -309,7 +287,7 @@ func (s *session) onEvent(raw []byte) {
 	sink := s.sink
 	needResume := sink == nil && !s.resuming
 	if needResume {
-		s.resuming = true // held until the actor attaches (or resume errors)
+		s.resuming = true
 	}
 	var frames [][]byte
 	if sink != nil && s.settled {
@@ -319,23 +297,17 @@ func (s *session) onEvent(raw []byte) {
 
 	switch {
 	case frames != nil:
-		// Actor is connected and settled: deliver this new event now.
 		s.writeToSink(sink, frames)
 		s.noteActivity()
 	case sink != nil:
-		// Connected but still within the post-attach settle window: leave it
-		// buffered; the settle timer will deliver it.
+		// Connected but still settling; the settle path will deliver it.
 	case needResume:
 		go s.resumeActor()
 	}
 }
 
-// stampLocked rewrites an event's envelope_id to a fresh unique id, records the
-// mapping (fresh id -> event key) so a later ack can be matched back, logs the
-// (original, fresh) pair, and returns the frame to send. Caller holds mu.
-//
-// Fresh ids per delivery stop a client that dedupes by envelope_id (Bolt) from
-// dropping a redelivery as a duplicate; the actor de-dupes echoes by message ts.
+// stampLocked rewrites an event's envelope_id to a fresh id, records the mapping
+// so a later ack matches back, and returns the frame to send. Caller holds mu.
 func (s *session) stampLocked(e pendingEvent) []byte {
 	if s.freshIDs == nil {
 		s.freshIDs = make(map[string]uint64)
@@ -350,8 +322,8 @@ func (s *session) stampLocked(e pendingEvent) []byte {
 	return rewriteEnvelopeID(e.raw, fresh)
 }
 
-// buildEventFramesLocked returns one freshly-stamped frame per buffered event
-// (no hello). Caller holds mu.
+// buildEventFramesLocked returns one freshly-stamped frame per buffered event.
+// Caller holds mu.
 func (s *session) buildEventFramesLocked() [][]byte {
 	frames := make([][]byte, 0, len(s.buffer))
 	for _, e := range s.buffer {
@@ -360,17 +332,13 @@ func (s *session) buildEventFramesLocked() [][]byte {
 	return frames
 }
 
-// writeToSink writes frames to sink in order, under the write lock, bailing if
-// the sink is no longer current or a write fails. Undelivered events remain in
-// the buffer and are redelivered on the next attach.
+// writeToSink writes frames in order, bailing if the sink is no longer current
+// or a write fails; undelivered events stay buffered for the next attach.
 func (s *session) writeToSink(sink actorSink, frames [][]byte) {
 	s.sinkWrite.Lock()
 	defer s.sinkWrite.Unlock()
 	for _, f := range frames {
-		s.mu.Lock()
-		current := s.sink == sink
-		s.mu.Unlock()
-		if !current {
+		if !s.isCurrentSink(sink) {
 			return
 		}
 		if err := sink.WriteFrame(f); err != nil {
@@ -381,8 +349,15 @@ func (s *session) writeToSink(sink actorSink, frames [][]byte) {
 	}
 }
 
-// Ack removes an event from the buffer once the actor acknowledges it. The actor
-// acks the fresh, per-delivery envelope_id, which maps back to the event key.
+// isCurrentSink reports whether sink is still the session's active connection.
+func (s *session) isCurrentSink(sink actorSink) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sink == sink
+}
+
+// Ack drops the acked event from the buffer. The actor acks the fresh
+// per-delivery envelope_id, which maps back to the event key.
 func (s *session) Ack(actorEnvelopeID string) {
 	if actorEnvelopeID == "" {
 		return
@@ -399,24 +374,22 @@ func (s *session) Ack(actorEnvelopeID string) {
 			break
 		}
 	}
-	// Drop every fresh id that pointed at this (now-acked) event.
 	for fid, k := range s.freshIDs {
 		if k == key {
 			delete(s.freshIDs, fid)
 		}
 	}
-	s.armIdleLocked() // an ack is real actor->broker activity
+	s.armIdleLocked() // an ack is real activity
 }
 
-// randID returns a short random hex id for actor-facing envelope ids.
 func randID() string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
 
-// rewriteEnvelopeID returns raw with its top-level "envelope_id" replaced,
-// preserving all other fields. Falls back to raw if it is not a JSON object.
+// rewriteEnvelopeID replaces the top-level envelope_id, preserving other fields;
+// returns raw unchanged if it is not a JSON object.
 func rewriteEnvelopeID(raw []byte, fresh string) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -434,10 +407,8 @@ func rewriteEnvelopeID(raw []byte, fresh string) []byte {
 	return out
 }
 
-// resumeActor asks substrate to resume the actor. ResumeActor blocks until the
-// actor's readyz returns 200; the actor then reconnects and Attach flushes the
-// buffer. resuming stays set until Attach clears it, preventing duplicate
-// resumes in the window between resume completing and the actor reconnecting.
+// resumeActor asks substrate to resume the actor. Resume blocks until readyz is
+// green; resuming stays set until Attach clears it, preventing duplicate resumes.
 func (s *session) resumeActor() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -446,15 +417,14 @@ func (s *session) resumeActor() {
 	if err := s.reg.resumer.Resume(ctx, s.ref); err != nil {
 		s.reg.log.Error("egress-broker: resuming actor failed", slog.String("actor", s.ref.String()), slog.Any("err", err))
 		s.mu.Lock()
-		s.resuming = false // allow a later event to retry
+		s.resuming = false
 		s.mu.Unlock()
 	}
 }
 
-// Attach registers the actor's Socket Mode connection, sends the hello frame,
-// and (re)delivers every buffered, un-acked event. Called when an actor
-// (re)connects — including when a client like Bolt opens a fresh connection
-// mid-startup, which is why delivery is redone here rather than assumed done.
+// Attach registers the actor's connection and sends hello. Buffered events are
+// held until the client signals ready (MarkReady); redelivery is redone here
+// because a client like Bolt opens a fresh connection mid-startup.
 func (s *session) Attach(sink actorSink) {
 	s.mu.Lock()
 	s.sink = sink
@@ -463,36 +433,25 @@ func (s *session) Attach(sink actorSink) {
 	buffered := len(s.buffer)
 	s.mu.Unlock()
 
-	// Send hello immediately so the client can run its handshake; hold events
-	// until it signals ready via its first heartbeat (see MarkReady). If there
-	// is nothing buffered, mark settled now so future events flow immediately.
 	s.writeToSink(sink, [][]byte{helloFrame})
 
 	if buffered == 0 {
-		// Nothing to hold; mark settled so subsequent events flow immediately.
-		s.deliverBufferedNow(sink, "attach")
+		s.deliverBufferedNow(sink, "attach") // nothing to hold; mark settled now
 		return
 	}
-	// Hold buffered events until the client's first heartbeat (MarkReady) — its
-	// connected:ready signal.
 	s.reg.log.Info("egress-broker: holding buffered events until the client's first heartbeat",
 		slog.String("actor", s.ref.String()), slog.Int("buffered", buffered))
 }
 
-// MarkReady is called when the actor's connection proves it is established —
-// its first Socket Mode heartbeat ping, which a client (Bolt) starts only once
-// it reaches connected:ready. That is the real "handshake complete" signal, so
-// we deliver buffered events on it instead of guessing with a timer. Called on
-// every heartbeat, but delivery is idempotent per attach.
+// MarkReady delivers buffered events on the actor's first Socket Mode heartbeat —
+// its connected:ready signal. Called on every heartbeat; delivery is idempotent
+// per attach.
 func (s *session) MarkReady(sink actorSink) {
 	s.deliverBufferedNow(sink, "heartbeat")
 }
 
-// deliverBufferedNow marks the connection settled and delivers all buffered
-// events (freshly stamped) to sink, if it is still the current connection and
-// has not already been settled for this attach. Idempotent per attach, so it
-// logs (and delivers) at most once per connection. trigger names what caused
-// delivery (heartbeat / fallback / attach) for observability.
+// deliverBufferedNow marks the connection settled and delivers buffered events
+// once per attach.
 func (s *session) deliverBufferedNow(sink actorSink, trigger string) {
 	s.mu.Lock()
 	if s.sink != sink || s.settled {
@@ -508,42 +467,37 @@ func (s *session) deliverBufferedNow(sink actorSink, trigger string) {
 			slog.String("actor", s.ref.String()), slog.Int("count", len(frames)), slog.String("trigger", trigger))
 	}
 	s.writeToSink(sink, frames)
-	// Attaching/delivering is activity: start the idle countdown. A bootstrap
-	// connection with nothing buffered lands here too, so an actor that just
-	// opened its Slack connection with no work also ages out and gets suspended.
-	s.noteActivity()
+	s.noteActivity() // attaching counts as activity, so an idle actor still ages out
 }
 
-// Detach clears the actor connection if it is still the current one. Also fires
-// when the broker suspends the actor and the checkpoint tears down its socket, so
-// it resets the idle-suspend state.
+// Detach clears the actor connection if it is still current, resetting idle state.
+// Also fires when a suspend checkpoint tears down the socket.
 func (s *session) Detach(sink actorSink) {
 	s.mu.Lock()
-	if s.sink == sink {
-		s.sink = nil
-		s.settled = false
-		s.suspending = false
-		s.inFlight = 0
-		if s.idleTmr != nil {
-			s.idleTmr.Stop()
-			s.idleTmr = nil
-		}
+	defer s.mu.Unlock()
+	if s.sink != sink {
+		return
 	}
-	s.mu.Unlock()
+	s.sink = nil
+	s.settled = false
+	s.suspending = false
+	s.inFlight = 0
+	if s.idleTmr != nil {
+		s.idleTmr.Stop()
+		s.idleTmr = nil
+	}
 }
 
-// Close stops the persistent Slack loop.
 func (s *session) Close() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return
 	}
 	s.closed = true
 	if s.stop != nil {
 		close(s.stop)
 	}
-	s.mu.Unlock()
 }
 
 func sleepOrStop(stop <-chan struct{}, d time.Duration) bool {

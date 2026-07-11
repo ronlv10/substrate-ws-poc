@@ -12,27 +12,23 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// Conn is a live Socket Mode connection to real Slack, owned by the broker and
-// kept open across actor suspend/resume cycles.
+// Conn is a live Socket Mode connection to real Slack, kept open across the
+// actor's suspend/resume cycles.
 type Conn interface {
-	// Read returns the next frame as an envelope; events_api frames also carry
-	// the raw bytes to forward to the actor.
+	// Read returns the next frame; events_api frames also carry raw bytes to
+	// forward to the actor.
 	Read() (Envelope, []byte, error)
-	// Ack acknowledges an event envelope back to Slack so it is not redelivered.
 	Ack(envelopeID string) error
 	Close() error
 }
 
-// Dialer reaches the real Slack API and opens Socket Mode connections. The broker
-// resolves Slack hostnames with the default cluster resolver: only the actor's
-// /etc/hosts redirects slack.com to the broker, so the broker is never redirected.
+// Dialer reaches real Slack. Only actors are redirected (via their /etc/hosts),
+// so the broker resolves Slack hostnames with the default resolver.
 type Dialer struct {
 	httpClient *http.Client
 	wsDialer   *websocket.Dialer
 }
 
-// apiBaseURL is the real Slack Web API base (no override — only actors are
-// redirected, so the broker reaches real Slack directly).
 const apiBaseURL = "https://" + APIHost
 
 func NewDialer() *Dialer {
@@ -42,15 +38,14 @@ func NewDialer() *Dialer {
 	}
 }
 
-// HTTPClient reaches real Slack; APIBaseURL is its base URL. Both are used by the
-// broker to forward passthrough API calls (e.g. chat.postMessage).
+// HTTPClient and APIBaseURL back the broker's passthrough of non-Socket-Mode
+// calls (e.g. chat.postMessage) to real Slack.
 func (d *Dialer) HTTPClient() *http.Client { return d.httpClient }
 func (d *Dialer) APIBaseURL() string       { return apiBaseURL }
 
-// Dial opens a Socket Mode connection to real Slack. slack-go handles
-// apps.connections.open, the WebSocket, heartbeats, and reconnection, over the
-// default resolver.
-func (d *Dialer) Dial(_ context.Context, appToken string) (Conn, error) {
+// Dial opens a Socket Mode connection to real Slack; slack-go handles the
+// handshake, heartbeats, and reconnection on its own background context.
+func (d *Dialer) Dial(appToken string) (Conn, error) {
 	api := slackgo.New("",
 		slackgo.OptionAppLevelToken(appToken),
 		slackgo.OptionHTTPClient(d.httpClient),
@@ -66,9 +61,8 @@ func (d *Dialer) Dial(_ context.Context, appToken string) (Conn, error) {
 	return &conn{client: client, ctx: ctx, cancel: cancel, pending: map[string]socketmode.Request{}}, nil
 }
 
-// conn adapts a slack-go socketmode client to Conn. Only events_api frames carry
-// raw bytes (the envelope forwarded to the actor); other frame types surface
-// their name so the session can log and ignore them.
+// conn adapts a slack-go socketmode client to Conn. Non-event frames surface only
+// their type name; the session logs and ignores them.
 type conn struct {
 	client *socketmode.Client
 	ctx    context.Context
@@ -83,6 +77,9 @@ func (c *conn) Read() (Envelope, []byte, error) {
 	case <-c.ctx.Done():
 		return Envelope{}, nil, c.ctx.Err()
 	case evt := <-c.client.Events:
+		// Only events_api frames carry a payload to forward to the actor; other
+		// types (hello, disconnect, connection errors) surface as type-only
+		// envelopes for the session to log and ignore.
 		if evt.Type != socketmode.EventTypeEventsAPI || evt.Request == nil {
 			return Envelope{Type: string(evt.Type)}, nil, nil
 		}

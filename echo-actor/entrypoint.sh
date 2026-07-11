@@ -1,9 +1,7 @@
 #!/bin/sh
-# Point the provider's hostnames at the egress broker for THIS actor only, by
-# resolving the broker Service (a stable ClusterIP, unaffected by broker pod
-# churn) and appending it to /etc/hosts. slack.com stays the TLS SNI, so the
-# broker's slack.com certificate still matches. Nothing is written to cluster
-# DNS, so the broker itself is never redirected.
+# Redirect Slack to the broker for THIS actor only, via /etc/hosts (the broker
+# Service ClusterIP is stable across broker pod churn). slack.com stays the TLS
+# SNI, and cluster DNS is untouched so the broker is never redirected onto itself.
 set -e
 
 broker="${BROKER_SERVICE:-egress-broker.ws-poc.svc.cluster.local}"

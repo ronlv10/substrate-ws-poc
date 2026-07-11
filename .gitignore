@@ -5,3 +5,6 @@ certs/ca.key
 echo-actor/node_modules/
 echo-actor/dist/
 echo-actor/package-lock.json
+
+# compiled broker binary
+/egress-broker

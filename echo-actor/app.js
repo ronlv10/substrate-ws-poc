@@ -2,28 +2,22 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 
-// actorRef reads this actor's substrate identity (/run/ate/atespace,
-// /run/ate/actor-id) and returns "<atespace>/<name>", sent to the broker as the
-// X-Ate-Actor header so it can key the session to this actor.
-//
-// It MUST be read fresh per request, never cached: an actor restored from a
-// golden snapshot holds whatever id it read at startup (the template's), but the
-// mounted file is regenerated on every resume and is correct.
+// actorRef reads this actor's substrate identity, sent to the broker as the
+// X-Ate-Actor header so it can key the session. Read fresh per request: a
+// golden-restored actor keeps the template's id until /run/ate is rewritten on resume.
 function actorRef() {
   try {
     const atespace = fs.readFileSync("/run/ate/atespace", "utf8").trim();
     const name = fs.readFileSync("/run/ate/actor-id", "utf8").trim();
     if (atespace && name) return `${atespace}/${name}`;
-  } catch (e) {
-    // Non-substrate/local run: no identity mount. Fall through to "" (the broker
-    // then falls back to source-IP resolution).
+  } catch {
+    // No identity mount; only happens outside substrate (local runs).
   }
   return "";
 }
 
-// Inject the X-Ate-Actor header (read fresh) on every HTTPS request to slack.com.
-// The Slack web-api SDK has no per-request header hook, so patch at the transport
-// layer; the broker reads this header on apps.connections.open to identify us.
+// The Slack SDK has no per-request header hook, so inject X-Ate-Actor at the
+// transport layer on every slack.com request.
 function hostOf(options) {
   if (typeof options === "string") { try { return new URL(options).hostname; } catch { return ""; } }
   return (options && (options.hostname || options.host)) || "";
@@ -33,17 +27,15 @@ https.request = function (options, ...rest) {
   try {
     if (typeof options === "object" && /(^|\.)slack\.com$/.test(hostOf(options))) {
       const ref = actorRef();
-      if (ref) {
-        options.headers = Object.assign({}, options.headers, { "X-Ate-Actor": ref });
-      }
+      if (ref) options.headers = Object.assign({}, options.headers, { "X-Ate-Actor": ref });
     }
-  } catch (e) { /* never break the request */ }
+  } catch { /* never break the request */ }
   return _httpsRequest(options, ...rest);
 };
 
 const { App, LogLevel } = require("@slack/bolt");
 
-// Readiness endpoint first, so substrate's readyz gate passes immediately.
+// Serves substrate's readyz gate.
 http
   .createServer((_req, res) => {
     res.writeHead(200);
@@ -51,8 +43,7 @@ http
   })
   .listen(80);
 
-// Log to stderr: Node block-buffers stdout to a pipe (invisible under gVisor
-// until flush), while stderr is unbuffered.
+// stderr, not stdout: Node block-buffers stdout to a pipe, invisible under gVisor.
 const log = (...a) => console.error("echo-actor:", ...a);
 
 const app = new App({
@@ -60,12 +51,9 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
   logLevel: LogLevel.INFO,
-  // Identity is injected per-request by the https patch above, not set here: a
-  // value cached here goes stale after a golden-snapshot restore.
 });
 
-// De-dupe: a channel message that mentions the bot can arrive as BOTH a
-// `message` and an `app_mention` event, so echo each Slack ts at most once.
+// A mention arrives as both `message` and `app_mention`; echo each ts once.
 const echoed = new Set();
 function firstTime(ts) {
   if (!ts || echoed.has(ts)) return false;
@@ -87,8 +75,6 @@ async function echoReply(event, say) {
   }
 }
 
-// Handle both plain channel messages and @-mentions (mentions arrive as
-// app_mention).
 app.message(async ({ message, say }) => echoReply(message, say));
 app.event("app_mention", async ({ event, say }) => echoReply(event, say));
 

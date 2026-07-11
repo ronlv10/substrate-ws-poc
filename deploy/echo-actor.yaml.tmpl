@@ -60,12 +60,9 @@ spec:
   pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
   containers:
   - name: echo
-    # The Bolt (Node) actor image, built + pinned by the Makefile (${ECHO_IMAGE}
-    # is substituted with the pushed digest). substrate ignores image ENV/CMD, so
-    # the command and env below are authoritative.
+    # ${ECHO_IMAGE} is substituted with the Makefile-pushed digest. substrate
+    # ignores image ENV/CMD, so the command and env here are authoritative.
     image: ${ECHO_IMAGE}
-    # entrypoint.sh resolves BROKER_SERVICE and points slack.com at it via
-    # /etc/hosts (per-actor; the broker is never redirected), then starts Bolt.
     command: ["/app/entrypoint.sh"]
     env:
     - name: SLACK_APP_TOKEN
@@ -81,8 +78,8 @@ spec:
     # The egress broker Service the actor redirects slack.com to (stable ClusterIP).
     - name: BROKER_SERVICE
       value: "egress-broker.ws-poc.svc.cluster.local"
-    # Make Node trust the broker CA that atelet mounts over the system bundle.
-    # Node ignores SSL_CERT_FILE; it honors NODE_EXTRA_CA_CERTS (adds to its roots).
+    # Node ignores SSL_CERT_FILE; NODE_EXTRA_CA_CERTS adds the broker cert (mounted
+    # by atelet) to its roots.
     - name: NODE_EXTRA_CA_CERTS
       value: "/etc/ssl/certs/ca-certificates.crt"
     readyz:
@@ -90,21 +87,17 @@ spec:
         path: /readyz
         port: 80
     volumeMounts:
-    # A durable-dir volume so onPause=Data has something to snapshot (the DATA
-    # snapshot requires at least one durable-dir volume). The echo actor writes
-    # nothing here — it exists only to satisfy the Data-snapshot path.
+    # onPause=Data requires a durable-dir volume to snapshot; the echo actor
+    # writes nothing here.
     - name: data
       mountPath: /data
   workerSelector:
     matchLabels:
       workload: ws-poc-echo
-  # onPause: Data snapshots only the durable-dir volume, NOT the process memory —
-  # so every resume COLD-BOOTS the actor from the image instead of warm-restoring
-  # a frozen process. Deliberate: warm-restoring the Bolt Socket Mode client
-  # resumes its dead external socket and churns through a primary/secondary
-  # reconnect that silently drops the delivered event. A fresh cold boot starts
-  # Bolt on one clean connection and dispatches reliably. The actor is stateless,
-  # so losing the process memory costs nothing.
+  # onPause: Data snapshots the volume, not process memory, so every resume
+  # cold-boots the actor. Deliberate: warm-restoring Bolt resumes its dead socket
+  # and churns through a reconnect that drops the delivered event; a cold boot
+  # starts one clean connection. The actor is stateless, so this costs nothing.
   snapshotsConfig:
     onPause: Data
     onCommit: Data

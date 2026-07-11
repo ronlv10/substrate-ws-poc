@@ -62,17 +62,3 @@ PATH="$HOME/go/1.25.4/bin:$PATH" ./demo/demo.sh
 
 Ctrl-C to stop either tool.
 
----
-
-## The idea in one paragraph
-
-A normal Slack bot holds a long-lived Socket Mode WebSocket and idles most of the
-time. On substrate, suspending an actor is a gVisor checkpoint that frees the
-worker and destroys its sockets — so the bot could never stay connected across a
-suspend. The **egress broker** (always-on) owns the real Slack connection instead;
-the actor dials `slack.com` transparently (redirected to the broker). When a
-message arrives the broker **resumes** the actor (a fresh cold boot, so its Bolt
-client starts clean), delivers the event over the ephemeral actor↔broker WS, the
-actor replies `echo: <text>`, and the broker **suspends** it again from the
-outside. Between messages the actor uses **zero compute**. See
-`../docs/sidecar-egress-proxy-plan.md` for the next evolution (keeping it warm).

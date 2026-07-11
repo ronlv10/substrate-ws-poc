@@ -17,40 +17,43 @@ arrives, the broker resumes the actor, the actor reconnects, and the broker
 delivers the buffered message. The actor replies `echo: <message>`, and once it
 goes idle the broker suspends it again.
 
-This is a concrete first step toward the "AgentGateway" egress phase already
-flagged in the codebase (`cmd/ateom-gvisor/main.go` — "the later AgentGateway
-phase should replace the broad masquerade path with transparent TCP capture").
-
-## Why this is the only shape that works
-
-- Suspend is `runsc` checkpoint/restore (substrate runs it with
-  `--allow-connected-on-save`). An established outbound TCP cannot be restored
-  onto a different worker with a different pod IP, so the socket is dead after a
-  restore — the process must **reconnect**. Socket Mode clients already
-  reconnect on `disconnect`, so a stock bot needs no changes.
-- Therefore the durable Slack connection must live **outside** the actor. The
-  broker owns it; the actor's connection to the broker is ephemeral and
-  re-established on each resume.
-- `Control.ResumeActor` blocks until the actor's `/readyz` returns 200, so
-  "resume, then the actor reconnects and we deliver" is race-free by construction.
-- All actor↔broker traffic is actor-initiated **egress**, so the broker never
-  needs the inbound atenet router or the actor's pod IP to deliver a message.
+> **Built on:** the [`ws-poc` branch of the substrate fork](https://github.com/ronlv10/substrate/tree/ws-poc).
+> That branch carries the two small, additive atelet changes this PoC depends on
+> (see [The substrate changes](#the-substrate-changes-in-the-fork)); everything
+> else uses stock substrate.
 
 ## Architecture
 
-```
-                       persistent, survives actor suspend
-  Slack  <===== wss (real TLS, broker holds it) =====>  BROKER  ── gRPC ResumeActor ──>  ateapi
-                                                            │   (in-cluster Deployment;
-   actor believes it dials slack.com;                       │    reaches real Slack via the
-   its /etc/hosts points slack.com at the broker; broker      │    default cluster resolver)
-   terminates TLS with a per-SNI cert the actor trusts        │
-        ECHO ACTOR  <===== wss + HTTPS (MITM'd) =====>  BROKER
-        (Socket Mode client + /readyz;                       forwards chat.postMessage → real Slack
-         broker suspends it when idle)                       captures the xapp- app token from traffic
+```mermaid
+flowchart LR
+    Slack(["Slack"])
+
+    subgraph K8s["Kubernetes cluster · agent-substrate"]
+        direction TB
+        CP["Substrate control plane"]
+        Broker["Egress Broker<br/><i>persistent · always-on</i>"]
+        Broker -- "Resume / Suspend Actor" --> CP
+    end
+
+    Actor["Echo Actor<br/>@slack/bolt — echo bot<br/><i>stock Slack bot · no lifecycle code</i><br/><i>SUSPENDED — off all workers</i>"]
+
+    Slack <== "Socket Mode WSS · persistent" ==> Broker
+    CP -. "restore / checkpoint" .-> Actor
+
+    classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
+    classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
+    classDef broker fill:#2a1e07,stroke:#d99a1c,color:#fde9b8;
+    classDef actor fill:#0c2417,stroke:#3f8f5f,color:#cfe8d6;
+    class Slack slack
+    class CP cp
+    class Broker broker
+    class Actor actor
 ```
 
-Two live connections, bridged by the broker:
+The **broker** holds the persistent Slack Socket Mode connection and drives the
+actor's lifecycle; the **actor** is a stock Slack bot that substrate checkpoints
+(suspends) and restores (resumes) on demand. Two live connections, bridged by the
+broker:
 
 - **Broker ↔ Slack** — a real Socket Mode WebSocket over real TLS, kept open
   across the actor's suspend/resume cycles. Opened with the app-level token the
@@ -62,9 +65,15 @@ Two live connections, bridged by the broker:
 
 State is keyed **per actor** (`atespace/name`), so each Slack connection maps to
 exactly one actor and inbound events route unambiguously. The actor announces its
-own identity in an `X-Ate-Actor` header (read fresh from its per-resume `/run/ate`
-mount); the broker falls back to source-IP correlation (`Actor.AteomPodIp` from
-the Control API) only when the header is absent.
+identity in an `X-Ate-Actor` header, read fresh from its per-resume `/run/ate`
+mount — deterministic, with no source-IP race after a resume.
+
+> **Note — identity header is a choice, not a hard dependency.** For now the actor
+> sends the `X-Ate-Actor` header (one small broker-aware shim in an otherwise stock
+> bot). It isn't fundamental: the broker could instead recover identity from the
+> connection's source IP (correlated to `Actor.AteomPodIp`, flakier right after a
+> resume), or a co-resident sidecar proxy could inject the header so the agent stays
+> 100% stock. We chose the header for determinism in this PoC.
 
 ### Message lifecycle
 
@@ -85,22 +94,6 @@ the Control API) only when the header is absent.
 Slack `hello` / `disconnect` frames and WebSocket ping/pong are **never**
 delivered and never wake the actor.
 
-## Components
-
-| Path | What it is |
-|------|------------|
-| `cmd/egress-broker/` | The egress broker: per-SNI TLS minting, Slack HTTPS handling (synthesize `apps.connections.open`, capture tokens, forward the rest), persistent Socket Mode client to Slack, Socket Mode server facing the actor, per-actor event buffer, and the `ResumeActor` client. |
-| `echo-actor/` | A normal Slack Bolt (Node) bot that echoes messages and exposes `/readyz`. It has no knowledge of the broker or of its own suspend/resume. |
-| `internal/socketmode/` | The small Socket Mode envelope types the broker uses. |
-| `internal/slackapi/` | The Slack Web API shape the broker synthesizes (`apps.connections.open`). |
-| `deploy/` | Broker Deployment/Service, CA installer DaemonSet, echo-actor WorkerPool/ActorTemplate. |
-| `certs/` | Broker CA generation. |
-
-This is a standalone Go module (`github.com/ronlv10/substrate-ws-poc`). It
-depends on public substrate only for the generated `ateapipb` gRPC client; the
-ateapi connection is dialed with `InsecureSkipVerify` (in-cluster mTLS
-identity), so no substrate `internal/` packages are imported.
-
 ## Transparent redirect and CA trust (PoC mechanisms)
 
 - **Redirect — per-actor `/etc/hosts`.** The actor's `entrypoint.sh` resolves the
@@ -109,31 +102,30 @@ identity), so no substrate `internal/` packages are imported.
   Bolt. `slack.com` stays the TLS SNI, so the broker's cert still matches. The
   redirect lives only in the actor, so the broker is never caught by it and cluster
   DNS is untouched — no upstream-resolver workaround, no blast radius.
-- **CA trust — node bundle mounted into actors.** `certs/gen-ca.sh` produces the
-  broker CA. The `ca-installer` DaemonSet publishes `system CAs + broker CA` to
-  the shared ateom hostPath on every node, and atelet is pointed at it via the
-  `ATE_ACTOR_CA_BUNDLE` env var; atelet then bind-mounts it into every actor
-  sandbox over `/etc/ssl/certs/ca-certificates.crt`.
+- **Cert trust — node bundle mounted into actors.** `certs/gen-ca.sh` produces the
+  broker's self-signed certificate (with `slack.com` / `wss-primary.slack.com`
+  SANs) once, at deploy. The `ca-installer` DaemonSet publishes `system CAs +
+  broker cert` to the shared ateom hostPath on every node, and atelet is pointed
+  at it via the `ATE_ACTOR_CA_BUNDLE` env var; atelet then bind-mounts it into
+  every actor sandbox over `/etc/ssl/certs/ca-certificates.crt`.
 
 ### The substrate changes (in the fork)
 
-The only substrate-side changes live on the **`ws-poc` branch of the substrate
-fork**: <https://github.com/ronlv10/substrate/tree/ws-poc>. Both are additive and
-opt-in (`cmd/atelet/oci.go`, `cmd/atelet/main.go`):
+The substrate-side changes live on the **`ws-poc` branch of the substrate fork**:
+<https://github.com/ronlv10/substrate/tree/ws-poc>. Both are additive and opt-in
+(`cmd/atelet/oci.go`, `cmd/atelet/main.go`):
 
-- when atelet is started with `ATE_ACTOR_CA_BUNDLE=<path>`, it bind-mounts that
-  CA bundle read-only over the actor's system CA store (inert when unset), so
-  actors trust the broker's CA;
-- atelet also writes the actor's atespace into the per-resume identity mount
-  (`/run/ate/atespace`) so an actor can read its own identity — the echo actor
-  sends it to the broker as the `X-Ate-Actor` header.
+- with `ATE_ACTOR_CA_BUNDLE=<path>`, atelet bind-mounts that CA bundle read-only
+  over the actor's system CA store (inert when unset), so actors trust the broker cert;
+- atelet writes the actor's atespace into the per-resume identity mount
+  (`/run/ate/atespace`), which the actor sends to the broker as the `X-Ate-Actor` header.
 
 Everything else uses the existing Control API. Build the cluster from that fork
 branch so the atelet image includes these changes.
 
 ## Prerequisites
 
-- A running substrate cluster built from the `ws-poc` fork branch (kind
+- A running substrate cluster built from the [`ws-poc` fork branch](https://github.com/ronlv10/substrate/tree/ws-poc) (kind
   quickstart: `hack/create-kind-cluster.sh && hack/install-ate-kind.sh
   --deploy-ate-system`). Note the snapshot bucket (`BUCKET_NAME`) and build the
   `ateom-gvisor` image (`ko build github.com/agent-substrate/substrate/cmd/ateom-gvisor`)
@@ -193,17 +185,9 @@ make create-actor
 make test        # go test ./...
 ```
 
-Unit tests cover per-SNI certificate minting (leaves verify against the CA),
-Socket Mode envelope classification (keepalive vs. real event), the event
-buffer + immediate Slack-ack, keepalive filtering, resume orchestration, and
-per-actor session keying — using fakes, no cluster required.
-
-## Blast radius (accepted for this PoC)
-
-The redirect is per-actor (`/etc/hosts`), so it has no blast radius. The one
-cluster-wide mechanism left is the **CA mount**: atelet mounts the broker CA into
-every actor sandbox, so every actor trusts it. That is acceptable on a dedicated
-demo cluster; production would gate the CA per ActorTemplate (see below).
+Unit tests cover Socket Mode envelope classification (keepalive vs. real event),
+the event buffer + immediate Slack-ack, keepalive filtering, resume
+orchestration, and per-actor session keying — using fakes, no cluster required.
 
 ## Production hardening (documented, not built)
 
@@ -211,7 +195,7 @@ demo cluster; production would gate the CA per ActorTemplate (see below).
   hostname egress; production would use in-pod `nftables` TPROXY/DNAT egress
   capture in `cmd/ateom-gvisor/main.go` (`installActorNftablesRules`) and
   `cmd/ateom-microvm/net.go`, scoped to opted-in actors. That also catches
-  IP-literal egress and is the sanctioned "AgentGateway" direction.
+  IP-literal egress.
 - **Centrally managed CA**, gated per ActorTemplate rather than cluster-wide.
 - **Multi-tenant Socket Mode.** The broker forwards HTTPS for any actor but only
   brokers Socket Mode for identified WS-PoC actors; full per-app Socket Mode

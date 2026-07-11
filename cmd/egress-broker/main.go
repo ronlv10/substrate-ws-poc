@@ -1,13 +1,8 @@
-// Command egress-broker is the egress broker: an always-on service that owns the
-// persistent realtime connection to a messaging provider (Slack today) on behalf
-// of suspendable substrate actors.
-//
-// Actors believe they dial the provider directly; their traffic is redirected to
-// this broker, which terminates TLS with a per-SNI certificate signed by a CA the
-// actors trust. The broker captures the app token from the actor's bootstrap,
-// holds the real provider connection itself, and — when a real message arrives
-// while the actor is suspended — resumes the actor via the substrate Control API
-// and delivers the buffered event when the actor's connection signals ready.
+// Command egress-broker is an always-on service that holds a suspendable actor's
+// persistent Slack connection. The actor's Slack traffic is redirected here (TLS
+// terminated with a cert the actor trusts); the broker captures its app token,
+// holds the real Slack connection, and on an incoming message resumes the actor
+// via the substrate Control API and delivers the event once it reconnects.
 //
 // See README.md for the full design.
 package main
@@ -24,6 +19,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/ronlv10/substrate-ws-poc/internal/broker"
 	"github.com/ronlv10/substrate-ws-poc/internal/slack"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
@@ -33,8 +29,8 @@ import (
 func main() {
 	var (
 		listenAddr   = pflag.String("listen", ":443", "TLS listen address for actor-facing traffic")
-		caCertFile   = pflag.String("ca-cert", "/etc/ws-poc/ca/tls.crt", "Broker CA certificate (PEM) used to mint per-SNI leaves")
-		caKeyFile    = pflag.String("ca-key", "/etc/ws-poc/ca/tls.key", "Broker CA private key (PEM)")
+		caCertFile   = pflag.String("ca-cert", "/etc/ws-poc/ca/tls.crt", "Broker TLS certificate (PEM) served to actors on the redirected Slack hostnames")
+		caKeyFile    = pflag.String("ca-key", "/etc/ws-poc/ca/tls.key", "Broker TLS private key (PEM)")
 		ateapiAddr   = pflag.String("ateapi-address", "api.ate-system.svc:443", "Substrate Control API (ateapi) address")
 		bootOnResume = pflag.Bool("boot-on-resume", false, "Boot actors fresh on resume instead of restoring the checkpoint")
 		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "Suspend an actor after its broker-facing connection is quiet in both directions (no event, ack, or forwarded API call; keepalive pings excluded) for this long. 0 disables broker-driven suspend")
@@ -44,9 +40,9 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 
-	minter, err := newCertMinterFromFiles(*caCertFile, *caKeyFile)
+	cert, err := tls.LoadX509KeyPair(*caCertFile, *caKeyFile)
 	if err != nil {
-		log.Error("egress-broker: loading broker CA", slog.Any("err", err))
+		log.Error("egress-broker: loading broker TLS certificate", slog.Any("err", err))
 		os.Exit(1)
 	}
 
@@ -55,16 +51,16 @@ func main() {
 		log.Error("egress-broker: dialing Control API", slog.Any("err", err))
 		os.Exit(1)
 	}
-	control := newControlClient(api, *bootOnResume)
+	control := broker.NewControlClient(api, *bootOnResume)
 
 	dialer := slack.NewDialer()
-	reg := NewRegistry(control, control, dialer, *idleGrace, log)
-	srv := NewServer(reg, control, dialer, log)
+	reg := broker.NewRegistry(control, control, dialer, *idleGrace, log)
+	srv := broker.NewServer(reg, dialer, log)
 
 	httpServer := &http.Server{
 		Addr:      *listenAddr,
 		Handler:   srv,
-		TLSConfig: minter.TLSConfig(),
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -76,18 +72,14 @@ func main() {
 	}()
 
 	log.Info("egress-broker: broker listening", slog.String("addr", *listenAddr))
-	// Cert and key are provided by the minter's GetCertificate, so the file
-	// arguments are empty.
+	// The certificate is set on TLSConfig above, so the file arguments are empty.
 	if err := httpServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("egress-broker: broker server exited", slog.Any("err", err))
 		os.Exit(1)
 	}
 }
 
-// dialControl connects to the substrate Control API (ateapi). Client identity is
-// carried by the pod-projected mTLS credentials; the server verifies them but
-// (in mtls mode) performs no app-level authorization, so an in-cluster client
-// dials with InsecureSkipVerify — matching the substrate demos.
+// dialControl connects to the substrate Control API (ateapi) over in-cluster mTLS.
 func dialControl(addr string) (ateapipb.ControlClient, error) {
 	creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // in-cluster mTLS identity
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
