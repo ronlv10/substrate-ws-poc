@@ -31,14 +31,17 @@ flowchart LR
     subgraph K8s["Kubernetes cluster · agent-substrate"]
         direction TB
         CP["Substrate control plane"]
-        Broker["Egress Broker<br/><i>persistent · always-on</i>"]
+        Broker["Egress Broker<br/>persistent · always-on"]
+        Actor["Echo Actor<br/>@slack/bolt — echo bot<br/>stock Slack bot · no lifecycle code<br/>suspended between messages"]
         Broker -- "Resume / Suspend Actor" --> CP
+        Broker <-.->|Socket Mode WS · only while resumed| Actor
+        CP -.->|restore / checkpoint| Actor
     end
 
-    Actor["Echo Actor<br/>@slack/bolt — echo bot<br/><i>stock Slack bot · no lifecycle code</i><br/><i>SUSPENDED — off all workers</i>"]
+    Slack <==>|Socket Mode WSS · persistent| Broker
 
-    Slack <== "Socket Mode WSS · persistent" ==> Broker
-    CP -. "restore / checkpoint" .-> Actor
+    linkStyle 3 stroke:#2ea043,stroke-width:3px
+    linkStyle 1 stroke:#3ec7d4,stroke-width:2px
 
     classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
     classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
