@@ -223,6 +223,25 @@ func TestFailedSendKeepsEventForNextAttach(t *testing.T) {
 	}
 }
 
+func TestUnackedEventDefersIdleSuspend(t *testing.T) {
+	s, conn, _, suspender := newTestSession(t, 50*time.Millisecond)
+	sink := &fakeSink{}
+	s.Attach(sink, 0)
+
+	conn.frames <- eventFrame("e1")
+	waitFor(t, "delivery", func() bool { return len(sink.delivered()) == 1 })
+
+	// A delivered-but-unacked event must hold suspend off.
+	time.Sleep(120 * time.Millisecond)
+	if got := suspender.suspends(); got != 0 {
+		t.Fatalf("suspended with an unacked event: %d", got)
+	}
+
+	// Acking it lets the actor go idle and suspend.
+	s.Ack(1)
+	waitFor(t, "idle suspend", func() bool { return suspender.suspends() == 1 })
+}
+
 func TestIdleSuspendFiresAndForwardDefersIt(t *testing.T) {
 	s, _, _, suspender := newTestSession(t, 50*time.Millisecond)
 	sink := &fakeSink{}

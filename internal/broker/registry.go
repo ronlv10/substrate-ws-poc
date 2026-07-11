@@ -96,13 +96,16 @@ func (s *session) noteActivity() {
 }
 
 // armIdleLocked (re)arms the idle timer unless the actor is disconnected, a
-// suspend or relay is in flight, or idle suspend is off. Caller holds mu.
+// suspend or relay is in flight, an event is still unacked, or idle suspend is
+// off. Suspending with a buffered event would checkpoint the actor mid-handle
+// and redeliver on the next resume — a loop if the handler is slower than the
+// idle grace. Caller holds mu.
 func (s *session) armIdleLocked() {
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
 		s.idleTmr = nil
 	}
-	if s.sink == nil || s.suspending || s.inFlight > 0 || s.reg.idleGrace <= 0 {
+	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 || s.reg.idleGrace <= 0 {
 		return
 	}
 	s.idleTmr = time.AfterFunc(s.reg.idleGrace, s.onIdle)
@@ -110,7 +113,7 @@ func (s *session) armIdleLocked() {
 
 func (s *session) onIdle() {
 	s.mu.Lock()
-	if s.sink == nil || s.suspending || s.inFlight > 0 {
+	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 {
 		s.mu.Unlock()
 		return
 	}
