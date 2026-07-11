@@ -37,7 +37,7 @@ What you see:
   - **Slack ⇄ Broker** — a **green, bidirectional, always-on** link: the persistent
     Socket Mode connection the broker holds on the actor's behalf. This never drops.
   - **Actor ⇄ Broker** — a **teal ephemeral link** that **appears when the actor
-    boots and fades out on suspend** (the actor's own Socket Mode WS).
+    resumes and fades out on suspend** (the proxy's gRPC session to the broker).
   - The **gray** arrows (Resume/Suspend, restore/checkpoint) light up and animate a
     packet **one hop at a time (~1.5 s each)** only while that request is happening.
 - **⏱ Time awake** — cumulative seconds the actor was actually on a worker (ticks
@@ -60,19 +60,4 @@ every line `[BROKER]` (orchestration) or `[ACTOR]` (plain Bolt/echo), plus a
 PATH="$HOME/go/1.25.4/bin:$PATH" ./demo/demo.sh
 ```
 
-Ctrl-C to stop either tool.
-
----
-
-## The idea in one paragraph
-
-A normal Slack bot holds a long-lived Socket Mode WebSocket and idles most of the
-time. On substrate, suspending an actor is a gVisor checkpoint that frees the
-worker and destroys its sockets — so the bot could never stay connected across a
-suspend. The **egress broker** (always-on) owns the real Slack connection instead;
-the actor dials `slack.com` transparently (redirected to the broker). When a
-message arrives the broker **resumes** the actor (a fresh cold boot, so its Bolt
-client starts clean), delivers the event over the ephemeral actor↔broker WS, the
-actor replies `echo: <text>`, and the broker **suspends** it again from the
-outside. Between messages the actor uses **zero compute**. See
-`../docs/sidecar-egress-proxy-plan.md` for the next evolution (keeping it warm).
+Ctrl-C to stop either tool. See the repo `README.md` for the architecture.

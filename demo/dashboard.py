@@ -8,7 +8,7 @@
 # the cluster for component health and streams the broker's lifecycle events
 # (Server-Sent Events); when you post a Slack message the diagram animates the
 # request/message flow along labeled arrows:
-#   Slack -> Broker -> ateapi (ResumeActor) -> Actor (cold boot) -> deliver ->
+#   Slack -> Broker -> ateapi (ResumeActor) -> Actor (warm restore) -> deliver ->
 #   echo -> Slack -> Broker (SuspendActor) -> Actor SUSPENDED (checkpoint).
 #
 #   python3 dashboard.py            # then open http://localhost:8080
@@ -444,7 +444,7 @@ function play(ev){
   // short RUNNING window). Hold off the poll for ~25s while a wake is in flight,
   // and update the node AFTER its arrow has travelled so it doesn't jump ahead.
   const now=performance.now(), after=(fn,d)=>setTimeout(fn,d);
-  if(ev.type==='resume'){ actorHint=now+25000; liveUp=true; after(()=>setActor(false, WARN, 'RESUMING — cold boot…'), 1300); }
+  if(ev.type==='resume'){ actorHint=now+25000; liveUp=true; after(()=>setActor(false, WARN, 'RESUMING — warm restore…'), 1300); }
   else if(ev.type==='boot'){ actorHint=now+25000; liveUp=true; after(()=>setActor(false, RUN, 'RUNNING — booted & connected'), 1300); }
   else if(ev.type==='deliver' || ev.type==='echo'){ actorHint=now+25000; liveUp=true; setActor(false, RUN, 'RUNNING'); }
   else if(ev.type==='suspend'){ actorHint=now+5000;
