@@ -42,7 +42,6 @@ spec:
         image: ko://github.com/ronlv10/substrate-ws-poc/cmd/egress-broker
         args:
         - --grpc-listen=:9090
-        - --dns-upstream=8.8.8.8:53
         - --ateapi-address=api.ate-system.svc:443
         ports:
         - name: grpc
