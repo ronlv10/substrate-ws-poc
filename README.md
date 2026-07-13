@@ -17,40 +17,7 @@ The proxy is agent-agnostic. Two actors ship on it:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Slack(["Slack"])
-
-    subgraph K8s["Kubernetes cluster · agent-substrate"]
-        direction TB
-        CP["Substrate control plane"]
-        Broker["Egress Broker<br/>persistent · always-on"]
-        subgraph Actor["Actor · suspended between messages"]
-            direction TB
-            Agent["Stock Slack agent<br/>(echo / OpenClaw)"]
-            Proxy["Local proxy<br/>impersonates slack.com"]
-            Agent <-->|"Socket Mode WS · loopback<br/>survives checkpoint"| Proxy
-        end
-        Broker -- "Resume / Suspend Actor" --> CP
-        Proxy <-.->|"gRPC session · only while resumed"| Broker
-        CP -.->|restore / checkpoint| Actor
-    end
-
-    Slack <==>|Socket Mode WSS · persistent| Broker
-
-    linkStyle 0 stroke:#3ec7d4,stroke-width:3px
-    linkStyle 3 stroke:#2ea043,stroke-width:2px
-    linkStyle 4 stroke:#3ec7d4,stroke-width:2px
-
-    classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
-    classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
-    classDef broker fill:#2a1e07,stroke:#d99a1c,color:#fde9b8;
-    classDef actor fill:#0c2417,stroke:#3f8f5f,color:#cfe8d6;
-    class Slack slack
-    class CP cp
-    class Broker broker
-    class Agent,Proxy actor
-```
+![Architecture](docs/architecture.png)
 
 - **Broker ↔ Slack** — real Socket Mode WSS, held across suspend. Opened with the
   app token the broker captured from the agent's `apps.connections.open`; the
@@ -60,8 +27,8 @@ flowchart LR
   suspend; the proxy re-announces on resume and replays from its last ack.
 
 After each restore the agent re-dials its Socket Mode connection once (pong
-staleness reads the jumped wall clock), but it's a ~40 ms loopback hop and the
-proxy holds every event until the agent heartbeats, so nothing is lost.
+staleness reads the jumped wall clock), but it's a loopback hop and the proxy
+holds every event until the agent heartbeats, so nothing is lost.
 
 ## Running a stateful agent
 
@@ -85,10 +52,9 @@ OpenClaw-specific setup, in `deploy/openclaw-actor.yaml.tmpl` and the baked
   referencing the key via `{source: env, id: ANTHROPIC_API_KEY}` so the secret
   stays out of the image.
 - Disable per-turn features a responder doesn't need (memory search, startup
-  context, commitment inference, browser) — they cut agent setup from ~20 s to
-  ~3 s.
+  context, commitment inference, browser) — they otherwise dominate setup time.
 
-Cycle latency ≈ 18 s: ~12 s resume, ~3 s agent setup, ~3 s model call.
+A suspended→answered cycle is dominated by the resume path, then the model call.
 
 ## Layout
 
@@ -145,9 +111,8 @@ app serves one actor (shared tokens split events — see backlog). Omit
 make test
 ```
 
-Broker session (buffer, resume-once, attach-by-`last_acked_seq`, idle suspend,
-handling hold), the gRPC session over bufconn, and the proxy (token capture,
-hold-until-heartbeat, readiness) — all with fakes, no cluster.
+Unit tests cover the broker session, the gRPC session (bufconn), and the proxy —
+all with fakes, no cluster.
 
 ## Backlog
 
