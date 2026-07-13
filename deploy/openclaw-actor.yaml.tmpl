@@ -1,0 +1,141 @@
+# The openclaw actor: a real Claude agent (OpenClaw) plus its local proxy, run as
+# a suspendable actor. Substitute the ${...} vars (the Makefile does). Needs two
+# secrets in this namespace: `slack-tokens` (app-token, bot-token) and
+# `anthropic-api-key` (api-key).
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-ws-poc
+
+---
+
+# ate-api-server resolves the ActorTemplate's secretKeyRef env at golden-snapshot
+# / resume time, so it needs read access to each referenced secret by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ate-api-server-openclaw-secrets
+  namespace: ate-demo-ws-poc
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["slack-tokens", "anthropic-api-key"]
+  verbs: ["get"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ate-api-server-openclaw-secrets
+  namespace: ate-demo-ws-poc
+subjects:
+- kind: ServiceAccount
+  name: ate-api-server
+  namespace: ate-system
+roleRef:
+  kind: Role
+  name: ate-api-server-openclaw-secrets
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: ws-poc-openclaw
+  namespace: ate-demo-ws-poc
+  labels:
+    workload: ws-poc-openclaw
+spec:
+  replicas: 2
+  ateomImage: ${ATEOM_IMAGE}
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: openclaw
+  namespace: ate-demo-ws-poc
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: openclaw
+    # substrate ignores image ENV/CMD, so command and env here are authoritative.
+    image: ${OPENCLAW_IMAGE}
+    # Seed the baked config + installed plugin onto the durableDir once, then run
+    # OpenClaw with every writable path (HOME, state, tmp, caches) pointed at
+    # /data. Keeping the overlay rootfs clean — like the stateless echo actor — is
+    # what lets `runsc restore` succeed: a dirtied rootfs overlay trips the
+    # filestore-collision check and wedges warm restore.
+    command:
+    - /local-proxy
+    - --broker-address=${BROKER_ADDRESS}
+    - --
+    - sh
+    - -c
+    - "mkdir -p /data/oc/.openclaw /data/tmp /data/oc/.cache /data/oc/.npm && cp -an /home/node/.openclaw/. /data/oc/.openclaw/ 2>/dev/null; exec node /app/openclaw.mjs gateway"
+    env:
+    - name: SLACK_APP_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: app-token
+    - name: SLACK_BOT_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: bot-token
+    # OpenClaw does not read ANTHROPIC_API_KEY itself; the config's model provider
+    # references it via {source: env, id: ANTHROPIC_API_KEY}, so it must be present
+    # in the environment. The provider baseUrl lives in the baked config, not here.
+    - name: ANTHROPIC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: anthropic-api-key
+          key: api-key
+    # Trust the image-baked proxy CA (Node honors NODE_EXTRA_CA_CERTS).
+    - name: NODE_EXTRA_CA_CERTS
+      value: "/etc/local-proxy/ca/proxy-ca.crt"
+    # Every writable path off the overlay rootfs -> /data (durableDir).
+    - name: HOME
+      value: "/data/oc"
+    - name: OPENCLAW_HOME
+      value: "/data/oc"
+    - name: OPENCLAW_STATE_DIR
+      value: "/data/oc/.openclaw"
+    - name: OPENCLAW_CONFIG_DIR
+      value: "/data/oc/.openclaw"
+    - name: OPENCLAW_CONFIG_PATH
+      value: "/data/oc/.openclaw/openclaw.json"
+    - name: TMPDIR
+      value: "/data/tmp"
+    - name: TMP
+      value: "/data/tmp"
+    - name: TEMP
+      value: "/data/tmp"
+    - name: XDG_CACHE_HOME
+      value: "/data/oc/.cache"
+    - name: NPM_CONFIG_CACHE
+      value: "/data/oc/.npm"
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  workerSelector:
+    matchLabels:
+      workload: ws-poc-openclaw
+  # onPause: Full warm-restores the whole sandbox with memory: the agent<->proxy
+  # loopback socket survives, only the proxy's broker stream reconnects.
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Full
+    location: gs://${BUCKET_NAME}/ate-demo-ws-poc/
+  volumes:
+  - name: data
+    durableDir: {}

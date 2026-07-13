@@ -1,0 +1,74 @@
+{
+  "plugins": {
+    "entries": {
+      "slack": {
+        "enabled": true
+      }
+    },
+    "allow": [
+      "slack"
+    ]
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.6.11",
+    "lastTouchedAt": "2026-07-12T04:18:47.029Z"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/azure/anthropic/claude-opus-4-8"
+      },
+      "sandbox": {
+        "mode": "off"
+      },
+      "memorySearch": {
+        "enabled": false
+      },
+      "startupContext": {
+        "enabled": false
+      }
+    }
+  },
+  "commitments": {
+    "enabled": false
+  },
+  "browser": {
+    "enabled": false
+  },
+  "models": {
+    "providers": {
+      "anthropic": {
+        "baseUrl": "https://inference-api.nvidia.com",
+        "apiKey": {
+          "source": "env",
+          "provider": "default",
+          "id": "ANTHROPIC_API_KEY"
+        }
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback"
+  },
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "mode": "socket",
+      "appToken": {
+        "source": "env",
+        "provider": "default",
+        "id": "SLACK_APP_TOKEN"
+      },
+      "botToken": {
+        "source": "env",
+        "provider": "default",
+        "id": "SLACK_BOT_TOKEN"
+      },
+      "dmPolicy": "open",
+      "allowFrom": [
+        "*"
+      ]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+# Build inputs staged by the Makefile (cross-compiled proxy + generated certs).
+local-proxy
+proxy-certs/
