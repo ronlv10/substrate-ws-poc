@@ -4,18 +4,25 @@ A Slack bot holds a long-lived Socket Mode WebSocket. Suspending an actor on
 agent-substrate checkpoints the process and **destroys every socket it holds**,
 so a stock bot can't stay connected across a suspend.
 
-The fix: a **suspend-aware local egress proxy baked into the actor image**. The
+The fix: a **suspend-aware local egress proxy** running next to the agent. The
 agent talks Socket Mode to the proxy over **loopback** — both ends inside the
-sandbox, so `runsc` checkpoint/restore preserves it and the agent never sees a
-dead socket. The proxy absorbs the suspend: it speaks resumable gRPC to an
+sandbox, so `runsc` checkpoint/restore preserves the socket and the agent never
+sees it die. The proxy absorbs the suspend: it speaks resumable gRPC to an
 always-on **egress broker** (which owns the real Slack connection) and
 re-announces from its last ack on resume. Only the proxy↔broker leg drops, and
-the agent itself stays stock.
+the agent stays stock.
 
-The proxy is agent-agnostic. Two actors ship on it:
+The proxy runs one of two ways — the loopback and everything below it are
+identical either way:
 
-- **`echo-actor`** — a stock `@slack/bolt` bot. Isolates the transport.
-- **`openclaw-actor`** — OpenClaw, a stateful agent, run unmodified.
+- **Baked in** — the proxy is PID 1 in the agent image and supervises the agent
+  (`echo-actor`).
+- **Sidecar** — the proxy is its own container in the actor, sharing the sandbox
+  network namespace so the loopback still works. The agent image is then stock
+  apart from a baked `/etc/hosts` + CA (`openclaw-actor`, via `proxy-sidecar/` +
+  `openclaw-agent/`). This keeps the agent image near-stock and the proxy image
+  reusable across agents; the loopback survives C/R across the container boundary
+  too.
 
 ## Architecture
 
@@ -24,7 +31,9 @@ The proxy is agent-agnostic. Two actors ship on it:
 - **Broker ↔ Slack** — real Socket Mode WSS, held across suspend. Opened with the
   app token the broker captured from the agent's `apps.connections.open`; the
   broker holds no pre-shared Slack secrets.
-- **Agent ↔ Proxy** — stock Socket Mode over loopback TLS. Survives the checkpoint.
+- **Agent ↔ Proxy** — stock Socket Mode over loopback TLS. Survives the checkpoint
+  (in the sidecar layout the two ends are separate containers sharing the sandbox
+  loopback; it survives all the same).
 - **Proxy ↔ Broker** — gRPC (`proto/brokerproxy`). The only leg that drops on
   suspend; the proxy re-announces on resume and replays from its last ack.
 
@@ -38,9 +47,11 @@ TLS session to Slack.
 
 ## Redirect and trust — per image, no cluster-wide blast radius
 
-- **Redirect.** The image's `/etc/hosts` points `slack.com` at `127.0.0.1`.
-- **Trust.** The image bakes a CA + `slack.com` leaf (`certs/gen-proxy-cert.sh`);
-  the agent trusts it via `NODE_EXTRA_CA_CERTS`. No node-level CA install.
+- **Redirect.** The agent image's `/etc/hosts` points `slack.com` at `127.0.0.1`.
+- **Trust.** One cert gen (`certs/gen-proxy-cert.sh`) produces a CA + `slack.com`
+  leaf: the proxy serves the leaf, the agent trusts the CA via
+  `NODE_EXTRA_CA_CERTS`. No node-level CA install. (Baked-in bundles both into
+  one image; sidecar splits them — leaf in the proxy image, CA in the agent.)
 - **Identity.** The proxy reads `atespace/name` fresh from the per-resume
   `/run/ate` mount on every announce (never cached). Needs the substrate fork's
   [`ws-poc` branch](https://github.com/ronlv10/substrate/tree/ws-poc) — the only
@@ -57,11 +68,16 @@ make deploy-actor  BUCKET_NAME=<bucket> ATEOM_IMAGE=<digest> \
      BROKER_ADDRESS=egress-broker.ws-poc.svc.cluster.local:9090
 make create-actor
 
-# openclaw actor (also needs a model-endpoint key)
+# openclaw actor, baked-in proxy (also needs a model-endpoint key)
 make anthropic-secret API_KEY=<inference key>
 make deploy-openclaw BUCKET_NAME=<bucket> ATEOM_IMAGE=<digest> \
      BROKER_ADDRESS=egress-broker.ws-poc.svc.cluster.local:9090
 make create-openclaw
+
+# openclaw actor, proxy as a sidecar (stock-ish agent + separate proxy container)
+make deploy-openclaw-sidecar BUCKET_NAME=<bucket> ATEOM_IMAGE=<digest> \
+     BROKER_ADDRESS=egress-broker.ws-poc.svc.cluster.local:9090
+make create-openclaw-sidecar
 ```
 
 Needs a Socket Mode Slack app: app token (`xapp-…`, `connections:write`), bot
