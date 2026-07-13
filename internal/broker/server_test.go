@@ -60,7 +60,7 @@ func newTestServer(t *testing.T, apiBase string) (*Server, *fakeSlackConn, *fake
 	conn := newFakeSlackConn()
 	resumer := &fakeResumer{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := NewRegistry(resumer, &fakeSuspender{}, nil, 0, log)
+	reg := NewRegistry(resumer, &fakeSuspender{}, nil, 0, 0, log)
 	srv := &Server{reg: reg, httpClient: http.DefaultClient, apiBase: apiBase, log: log}
 
 	// Pre-create the session and drive its read loop from the fake conn, so

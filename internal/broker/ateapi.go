@@ -48,7 +48,10 @@ func NewControlClient(api ateapipb.ControlClient, bootOnResume bool) *controlCli
 // so one caller giving up does not abort it, and retries only on Aborted.
 func (c *controlClient) Resume(ctx context.Context, ref ActorRef) error {
 	ch := c.flight.DoChan(ref.String(), func() (any, error) {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Must exceed substrate's readyz gate (the ResumeActor RPC blocks until
+		// the restored agent answers /readyz) plus a cold restore's GCS snapshot
+		// pull, which alone can run past 30s on a worker that hasn't cached it.
+		bgCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
 		backoff := wait.Backoff{Steps: 7, Duration: 200 * time.Millisecond, Factor: 1.5, Jitter: 0.2}

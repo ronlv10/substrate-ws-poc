@@ -27,10 +27,11 @@ import (
 
 func main() {
 	var (
-		grpcListen   = pflag.String("grpc-listen", ":9090", "proxy-facing gRPC listen address")
-		ateapiAddr   = pflag.String("ateapi-address", "api.ate-system.svc:443", "substrate Control API address")
-		bootOnResume = pflag.Bool("boot-on-resume", false, "boot actors fresh on resume instead of restoring the checkpoint (defeats warm restore; debugging only)")
-		idleGrace    = pflag.Duration("idle-grace", 5*time.Second, "suspend an actor after its proxy stream is quiet for this long (keepalives excluded); 0 disables")
+		grpcListen    = pflag.String("grpc-listen", ":9090", "proxy-facing gRPC listen address")
+		ateapiAddr    = pflag.String("ateapi-address", "api.ate-system.svc:443", "substrate Control API address")
+		bootOnResume  = pflag.Bool("boot-on-resume", false, "boot actors fresh on resume instead of restoring the checkpoint (defeats warm restore; debugging only)")
+		idleGrace     = pflag.Duration("idle-grace", 5*time.Second, "suspend an actor after its proxy stream is quiet for this long (keepalives excluded); 0 disables")
+		handlingGrace = pflag.Duration("handling-grace", 90*time.Second, "after an actor acks an inbound event, hold idle-suspend up to this long so the agent can produce its reply; 0 disables")
 	)
 	pflag.Parse()
 
@@ -45,7 +46,7 @@ func main() {
 	control := broker.NewControlClient(api, *bootOnResume)
 
 	dialer := slack.NewDialer()
-	reg := broker.NewRegistry(control, control, dialer, *idleGrace, log)
+	reg := broker.NewRegistry(control, control, dialer, *idleGrace, *handlingGrace, log)
 
 	ln, err := net.Listen("tcp", *grpcListen)
 	if err != nil {

@@ -109,6 +109,13 @@ func (bc *BrokerClient) session(client brokerproxypb.BrokerProxyClient) error {
 	if err != nil {
 		return err
 	}
+	// Hold the announce until the agent is settled (attached + heartbeated). The
+	// broker arms its idle-suspend clock on announce, so announcing mid-startup
+	// would let it checkpoint a not-yet-ready Node process — which SIGILLs on
+	// restore. On resume this waits out the agent's post-restore re-heartbeat.
+	if err := bc.core.WaitQuiescent(ctx); err != nil {
+		return err
+	}
 	token := bc.core.AppToken()
 	if token == "" {
 		token = os.Getenv("SLACK_APP_TOKEN")

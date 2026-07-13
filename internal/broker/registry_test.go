@@ -103,12 +103,29 @@ func newTestSession(t *testing.T, idleGrace time.Duration) (*session, *fakeSlack
 	resumer := &fakeResumer{}
 	suspender := &fakeSuspender{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := NewRegistry(resumer, suspender, nil, idleGrace, log)
+	// handlingGrace disabled here so the existing idle/ack tests keep their
+	// ack-then-suspend semantics; the hold has its own test below.
+	reg := NewRegistry(resumer, suspender, nil, idleGrace, 0, log)
 	s := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
 	stop := make(chan struct{})
 	go s.readSlackUntilClose(conn, stop)
 	t.Cleanup(func() { close(stop); close(conn.frames) })
 	return s, conn, resumer, suspender
+}
+
+// newHandlingSession builds a session with both idle and handling grace set, to
+// exercise the post-ack processing hold.
+func newHandlingSession(t *testing.T, idleGrace, handlingGrace time.Duration) (*session, *fakeSlackConn, *fakeSuspender) {
+	t.Helper()
+	conn := newFakeSlackConn()
+	suspender := &fakeSuspender{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := NewRegistry(&fakeResumer{}, suspender, nil, idleGrace, handlingGrace, log)
+	s := reg.GetOrCreate(ActorRef{Atespace: "demo", Name: "echo-1"})
+	stop := make(chan struct{})
+	go s.readSlackUntilClose(conn, stop)
+	t.Cleanup(func() { close(stop); close(conn.frames) })
+	return s, conn, suspender
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -240,6 +257,43 @@ func TestUnackedEventDefersIdleSuspend(t *testing.T) {
 	// Acking it lets the actor go idle and suspend.
 	s.Ack(1)
 	waitFor(t, "idle suspend", func() bool { return suspender.suspends() == 1 })
+}
+
+func TestHandlingHoldDefersSuspendUntilReply(t *testing.T) {
+	// Long handling grace, short idle grace: acking receipt must NOT let the
+	// actor suspend while the agent is still producing its reply.
+	s, conn, suspender := newHandlingSession(t, 20*time.Millisecond, time.Second)
+	sink := &fakeSink{}
+	s.Attach(sink, 0)
+
+	conn.frames <- eventFrame("e1")
+	waitFor(t, "delivery", func() bool { return len(sink.delivered()) == 1 })
+	s.Ack(1) // Socket Mode acks on receipt, before the reply
+
+	// Idle grace elapses, but the handling hold keeps the actor alive.
+	time.Sleep(80 * time.Millisecond)
+	if got := suspender.suspends(); got != 0 {
+		t.Fatalf("suspended mid-handle, before the reply: %d", got)
+	}
+
+	// The agent replies (an egress relay); once it completes, idle suspend fires.
+	s.beginForward()
+	s.endForward()
+	waitFor(t, "idle suspend after reply", func() bool { return suspender.suspends() == 1 })
+}
+
+func TestHandlingHoldExpiresWhenAgentNeverReplies(t *testing.T) {
+	// If the agent acks but never replies (e.g. ignores the message), the hold
+	// must cap so the actor still suspends.
+	s, conn, suspender := newHandlingSession(t, 20*time.Millisecond, 60*time.Millisecond)
+	sink := &fakeSink{}
+	s.Attach(sink, 0)
+
+	conn.frames <- eventFrame("e1")
+	waitFor(t, "delivery", func() bool { return len(sink.delivered()) == 1 })
+	s.Ack(1)
+
+	waitFor(t, "suspend after handling grace", func() bool { return suspender.suspends() == 1 })
 }
 
 func TestIdleSuspendFiresAndForwardDefersIt(t *testing.T) {

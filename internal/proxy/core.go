@@ -13,11 +13,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -90,6 +92,25 @@ func (c *Core) AgentQuiescent() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.agent != nil && c.ready
+}
+
+// WaitQuiescent blocks until AgentQuiescent holds or ctx is done. The broker
+// announce waits on this: the broker starts its idle-suspend clock when the
+// proxy announces, so announcing before the agent has settled would let the
+// broker checkpoint a still-starting Node process, which SIGILLs on restore.
+func (c *Core) WaitQuiescent(ctx context.Context) error {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if c.AgentQuiescent() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
 }
 
 // LastContiguousAcked is the resume point for the broker Announce: every event

@@ -30,21 +30,28 @@ type Registry struct {
 	// keepalives) before the broker suspends it; zero disables broker-driven suspend.
 	idleGrace time.Duration
 
+	// handlingGrace bounds how long the broker holds idle-suspend after the actor
+	// acks an inbound event, giving the agent time to produce its reply. Socket
+	// Mode acks on receipt, long before the agent responds, so without this the
+	// broker would checkpoint the actor mid-handle; zero disables the hold.
+	handlingGrace time.Duration
+
 	mu       sync.Mutex
 	sessions map[ActorRef]*session
 }
 
-func NewRegistry(resumer Resumer, suspender Suspender, dialer *slack.Dialer, idleGrace time.Duration, log *slog.Logger) *Registry {
+func NewRegistry(resumer Resumer, suspender Suspender, dialer *slack.Dialer, idleGrace, handlingGrace time.Duration, log *slog.Logger) *Registry {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Registry{
-		resumer:   resumer,
-		suspender: suspender,
-		dialer:    dialer,
-		idleGrace: idleGrace,
-		log:       log,
-		sessions:  make(map[ActorRef]*session),
+		resumer:       resumer,
+		suspender:     suspender,
+		dialer:        dialer,
+		idleGrace:     idleGrace,
+		handlingGrace: handlingGrace,
+		log:           log,
+		sessions:      make(map[ActorRef]*session),
 	}
 }
 
@@ -78,6 +85,13 @@ type session struct {
 	inFlight   int // outstanding actor->Slack relays; never suspend mid-send
 	suspending bool
 
+	// handling marks the actor as processing an event it acked receipt of but has
+	// not yet replied to. It bridges the gap between Socket Mode's on-receipt ack
+	// and the agent's much-later reply; released when the agent starts relaying
+	// its reply or handlingGrace elapses.
+	handling    bool
+	handlingTmr *time.Timer
+
 	sinkWrite sync.Mutex // serializes deliveries so flushes and new events stay ordered
 }
 
@@ -105,7 +119,7 @@ func (s *session) armIdleLocked() {
 		s.idleTmr.Stop()
 		s.idleTmr = nil
 	}
-	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 || s.reg.idleGrace <= 0 {
+	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 || s.handling || s.reg.idleGrace <= 0 {
 		return
 	}
 	s.idleTmr = time.AfterFunc(s.reg.idleGrace, s.onIdle)
@@ -113,7 +127,7 @@ func (s *session) armIdleLocked() {
 
 func (s *session) onIdle() {
 	s.mu.Lock()
-	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 {
+	if s.sink == nil || s.suspending || s.inFlight > 0 || len(s.buffer) > 0 || s.handling {
 		s.mu.Unlock()
 		return
 	}
@@ -140,6 +154,8 @@ func (s *session) onIdle() {
 func (s *session) beginForward() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The agent is now replying; the inFlight bracket takes over the hold.
+	s.clearHandlingLocked()
 	s.inFlight++
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
@@ -152,6 +168,42 @@ func (s *session) endForward() {
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
+	s.armIdleLocked()
+}
+
+// beginHandlingLocked starts (or extends) the processing hold after the actor
+// acks an inbound event, so idle-suspend waits for the agent's reply rather than
+// firing during Socket Mode's ack-before-handle gap. Caller holds mu.
+func (s *session) beginHandlingLocked() {
+	if s.reg.handlingGrace <= 0 {
+		return
+	}
+	s.handling = true
+	if s.handlingTmr != nil {
+		s.handlingTmr.Stop()
+	}
+	s.handlingTmr = time.AfterFunc(s.reg.handlingGrace, s.onHandlingExpire)
+}
+
+// clearHandlingLocked releases the processing hold. Caller holds mu.
+func (s *session) clearHandlingLocked() {
+	s.handling = false
+	if s.handlingTmr != nil {
+		s.handlingTmr.Stop()
+		s.handlingTmr = nil
+	}
+}
+
+// onHandlingExpire caps the processing hold so an event the agent never replies
+// to (e.g. an ignored message) still lets the actor suspend.
+func (s *session) onHandlingExpire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.handling {
+		return
+	}
+	s.handling = false
+	s.handlingTmr = nil
 	s.armIdleLocked()
 }
 
@@ -316,6 +368,9 @@ func (s *session) Ack(seq uint64) {
 	for i, e := range s.buffer {
 		if e.seq == seq {
 			s.buffer = append(s.buffer[:i], s.buffer[i+1:]...)
+			// Acking is receipt, not completion: hold suspend until the agent
+			// replies or the processing grace elapses.
+			s.beginHandlingLocked()
 			break
 		}
 	}
@@ -327,7 +382,7 @@ func (s *session) Ack(seq uint64) {
 // set until Attach clears it, preventing duplicate resumes in the window between
 // resume completing and the proxy reconnecting.
 func (s *session) resumeActor() {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	s.reg.log.Info("egress-broker: resuming suspended actor to deliver event", slog.String("actor", s.ref.String()))
@@ -377,6 +432,7 @@ func (s *session) Detach(sink eventSink) {
 	s.sink = nil
 	s.suspending = false
 	s.inFlight = 0
+	s.clearHandlingLocked()
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
 		s.idleTmr = nil
@@ -391,6 +447,7 @@ func (s *session) Close() {
 		return
 	}
 	s.closed = true
+	s.clearHandlingLocked()
 	if s.stop != nil {
 		close(s.stop)
 	}
