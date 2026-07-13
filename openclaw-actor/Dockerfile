@@ -1,13 +1,12 @@
-# The openclaw actor image: a real Claude agent (OpenClaw, a multi-channel AI
-# gateway) supervised by the same local egress proxy the echo actor uses. Built
-# by the Makefile (build-openclaw-image), which first cross-compiles
-# cmd/local-proxy into this directory and generates the proxy TLS material into
-# proxy-certs/.
+# The openclaw actor image: OpenClaw (a stateful agent) supervised by the same
+# local egress proxy the echo actor uses. Built by the Makefile
+# (build-openclaw-image), which first cross-compiles cmd/local-proxy into this
+# directory and generates the proxy TLS material into proxy-certs/.
 #
-# Unlike the echo actor, OpenClaw is a large prebuilt image (~1.5 GB) we layer
-# onto rather than a single bundled file. The proxy, certs, and /etc/hosts
-# redirect are added identically — the agent talks Socket Mode to slack.com over
-# loopback and never knows it is impersonated.
+# Unlike the echo actor, OpenClaw is a large prebuilt image we layer onto rather
+# than a single bundled file. The proxy, certs, and /etc/hosts redirect are added
+# identically — the agent talks Socket Mode to slack.com over loopback and never
+# knows it is impersonated.
 #
 # NOTE: substrate ignores image ENTRYPOINT/CMD/ENV — the actor's command and env
 # come from the ActorTemplate (deploy/openclaw-actor.yaml.tmpl). In particular

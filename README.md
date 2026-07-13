@@ -13,7 +13,7 @@ real Slack connection. On suspend only the proxy↔broker leg drops.
 The proxy is agent-agnostic. Two actors ship on it:
 
 - **`echo-actor`** — a stock `@slack/bolt` bot. Isolates the transport.
-- **`openclaw-actor`** — a real Claude agent (OpenClaw, ~1.5 GB), run unmodified.
+- **`openclaw-actor`** — OpenClaw, a stateful agent, run unmodified.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ flowchart LR
 
     linkStyle 0 stroke:#3ec7d4,stroke-width:3px
     linkStyle 3 stroke:#2ea043,stroke-width:2px
-    linkStyle 5 stroke:#3ec7d4,stroke-width:2px
+    linkStyle 4 stroke:#3ec7d4,stroke-width:2px
 
     classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
     classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
@@ -63,24 +63,32 @@ After each restore the agent re-dials its Socket Mode connection once (pong
 staleness reads the jumped wall clock), but it's a ~40 ms loopback hop and the
 proxy holds every event until the agent heartbeats, so nothing is lost.
 
-## Running a real agent: four constraints a stateless bot hides
+## Running a stateful agent
 
-- **Keep the rootfs clean.** OpenClaw writes state/cache/logs constantly; a dirty
-  overlay trips `runsc restore`'s filestore check and wedges the actor. The
-  template points `HOME` and every writable path at the `/data` durableDir.
+A stock agent that takes seconds to start and to answer forces two timing rules
+the broker and proxy enforce — invisible with the instant echo bot:
+
 - **Don't checkpoint mid-startup.** A V8 runtime frozen during init `SIGILL`s on
-  restore. The proxy defers its broker announce (which arms idle-suspend) until
-  the agent is quiescent — `Core.WaitQuiescent`.
+  restore. The broker arms idle-suspend when the proxy announces, so the proxy
+  defers its announce until the agent is quiescent — `Core.WaitQuiescent`.
 - **Don't suspend mid-turn.** Socket Mode acks on receipt, but the agent thinks
   for ~10–20 s before replying. The broker holds suspend from ack until the reply
   or a bounded grace (`--handling-grace`, 90 s).
-- **The agent ignores ambient creds.** OpenClaw reads no `ANTHROPIC_*` env; the
-  model provider is set in `openclaw-actor/openclaw.json`, referencing the key via
-  `{source: env, id: ANTHROPIC_API_KEY}` so the secret stays out of the image.
 
-Cycle latency ≈ 18 s: ~12 s resume, ~3 s agent setup, ~3 s model call. The
-config disables per-turn features a responder doesn't need (memory search,
-startup context, commitment inference, browser), which cut setup from ~20 s.
+OpenClaw-specific setup, in `deploy/openclaw-actor.yaml.tmpl` and the baked
+`openclaw.json`:
+
+- Point `HOME` and every writable path at the `/data` durableDir — OpenClaw
+  writes constantly, and a dirtied overlay rootfs trips `runsc restore`'s
+  filestore check.
+- Set the model provider in the config (OpenClaw reads no `ANTHROPIC_*` env),
+  referencing the key via `{source: env, id: ANTHROPIC_API_KEY}` so the secret
+  stays out of the image.
+- Disable per-turn features a responder doesn't need (memory search, startup
+  context, commitment inference, browser) — they cut agent setup from ~20 s to
+  ~3 s.
+
+Cycle latency ≈ 18 s: ~12 s resume, ~3 s agent setup, ~3 s model call.
 
 ## Layout
 
