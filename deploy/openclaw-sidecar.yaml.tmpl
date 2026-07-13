@@ -1,0 +1,132 @@
+# The openclaw actor in the sidecar layout: the proxy and the agent run as two
+# containers in one actor, sharing the sandbox network namespace so the agent
+# reaches the proxy on loopback. Substitute the ${...} vars (the Makefile does).
+# Needs `slack-tokens` and `anthropic-api-key` secrets in this namespace.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-ws-poc
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ate-api-server-openclaw-secrets
+  namespace: ate-demo-ws-poc
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["slack-tokens", "anthropic-api-key"]
+  verbs: ["get"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ate-api-server-openclaw-secrets
+  namespace: ate-demo-ws-poc
+subjects:
+- kind: ServiceAccount
+  name: ate-api-server
+  namespace: ate-system
+roleRef:
+  kind: Role
+  name: ate-api-server-openclaw-secrets
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: ws-poc-openclaw-sidecar
+  namespace: ate-demo-ws-poc
+  labels:
+    workload: ws-poc-openclaw-sidecar
+spec:
+  replicas: 2
+  ateomImage: ${ATEOM_IMAGE}
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: openclaw-sidecar
+  namespace: ate-demo-ws-poc
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  # The proxy sidecar owns loopback :443 (Slack impersonation) and :80 (readyz).
+  # readyz here gates the actor: it is 200 only once the agent has attached and
+  # heartbeated, so a resume waits for the settled agent in the sibling container.
+  - name: proxy
+    image: ${PROXY_IMAGE}
+    command: ["/local-proxy", "--broker-address=${BROKER_ADDRESS}"]
+    readyz:
+      httpGet:
+        path: /readyz
+        port: 80
+  # The agent runs stock apart from a baked /etc/hosts and CA. It writes every
+  # mutable path to the /data durableDir, keeping its overlay rootfs clean for
+  # restore.
+  - name: openclaw
+    image: ${OPENCLAW_AGENT_IMAGE}
+    command:
+    - sh
+    - -c
+    - "mkdir -p /data/oc/.openclaw /data/tmp /data/oc/.cache /data/oc/.npm && cp -an /home/node/.openclaw/. /data/oc/.openclaw/ 2>/dev/null; exec node /app/openclaw.mjs gateway"
+    env:
+    - name: SLACK_APP_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: app-token
+    - name: SLACK_BOT_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: slack-tokens
+          key: bot-token
+    - name: ANTHROPIC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: anthropic-api-key
+          key: api-key
+    - name: NODE_EXTRA_CA_CERTS
+      value: "/etc/local-proxy/ca/proxy-ca.crt"
+    - name: HOME
+      value: "/data/oc"
+    - name: OPENCLAW_HOME
+      value: "/data/oc"
+    - name: OPENCLAW_STATE_DIR
+      value: "/data/oc/.openclaw"
+    - name: OPENCLAW_CONFIG_DIR
+      value: "/data/oc/.openclaw"
+    - name: OPENCLAW_CONFIG_PATH
+      value: "/data/oc/.openclaw/openclaw.json"
+    - name: TMPDIR
+      value: "/data/tmp"
+    - name: TMP
+      value: "/data/tmp"
+    - name: TEMP
+      value: "/data/tmp"
+    - name: XDG_CACHE_HOME
+      value: "/data/oc/.cache"
+    - name: NPM_CONFIG_CACHE
+      value: "/data/oc/.npm"
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  workerSelector:
+    matchLabels:
+      workload: ws-poc-openclaw-sidecar
+  snapshotsConfig:
+    onPause: Full
+    onCommit: Full
+    location: gs://${BUCKET_NAME}/ate-demo-ws-poc/
+  volumes:
+  - name: data
+    durableDir: {}

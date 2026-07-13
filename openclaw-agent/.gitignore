@@ -1,0 +1,2 @@
+# Build inputs staged by the Makefile (the proxy CA, copied from the cert gen).
+proxy-certs/

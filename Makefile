@@ -13,6 +13,9 @@ BROKER_PKG := github.com/ronlv10/substrate-ws-poc/cmd/egress-broker
 # is a real Claude agent layered onto the upstream OpenClaw image.
 ECHO_IMAGE ?= localhost:5001/ws-poc-echo-actor
 OPENCLAW_IMAGE ?= localhost:5001/ws-poc-openclaw-actor
+# Sidecar layout: the proxy and the agent are separate images/containers.
+PROXY_IMAGE ?= localhost:5001/ws-poc-proxy-sidecar
+OPENCLAW_AGENT_IMAGE ?= localhost:5001/ws-poc-openclaw-agent
 ACTOR_ARCH ?= arm64
 
 # ateom-gvisor lives in substrate (the fork), not this repo, so its image is an
@@ -130,6 +133,39 @@ deploy-openclaw: build-openclaw-image
 create-openclaw:
 	kubectl ate create atespace demo || true
 	kubectl ate create actor openclaw-1 -a demo --template ate-demo-ws-poc/openclaw
+
+# Sidecar layout: build the proxy image (binary + TLS material) and the agent
+# image (stock OpenClaw + baked /etc/hosts + the same CA) from one cert gen, so
+# the leaf the proxy serves matches the CA the agent trusts.
+.PHONY: build-openclaw-sidecar-images
+build-openclaw-sidecar-images:
+	OUT_DIR=$(CURDIR)/proxy-sidecar/proxy-certs bash $(CADIR)/gen-proxy-cert.sh
+	GOOS=linux GOARCH=$(ACTOR_ARCH) CGO_ENABLED=0 \
+		go build -o proxy-sidecar/local-proxy ./cmd/local-proxy
+	docker build --platform linux/$(ACTOR_ARCH) -t $(PROXY_IMAGE):latest $(CURDIR)/proxy-sidecar
+	docker push $(PROXY_IMAGE):latest
+	mkdir -p openclaw-agent/proxy-certs
+	cp proxy-sidecar/proxy-certs/proxy-ca.crt openclaw-agent/proxy-certs/proxy-ca.crt
+	docker build --platform linux/$(ACTOR_ARCH) -t $(OPENCLAW_AGENT_IMAGE):latest $(CURDIR)/openclaw-agent
+	docker push $(OPENCLAW_AGENT_IMAGE):latest
+
+.PHONY: deploy-openclaw-sidecar
+deploy-openclaw-sidecar: build-openclaw-sidecar-images
+	@test -n "$(BUCKET_NAME)" || { echo "set BUCKET_NAME=<snapshot bucket>"; exit 1; }
+	@test -n "$(ATEOM_IMAGE)" || { echo "set ATEOM_IMAGE=<substrate ateom-gvisor image digest>"; exit 1; }
+	@PROXY_REF=$$(docker inspect --format='{{index .RepoDigests 0}}' $(PROXY_IMAGE):latest); \
+		AGENT_REF=$$(docker inspect --format='{{index .RepoDigests 0}}' $(OPENCLAW_AGENT_IMAGE):latest); \
+		echo "proxy: $$PROXY_REF"; echo "agent: $$AGENT_REF"; \
+		sed -e "s|\$${BUCKET_NAME}|$(BUCKET_NAME)|g" -e "s|\$${PROXY_IMAGE}|$$PROXY_REF|g" \
+			-e "s|\$${OPENCLAW_AGENT_IMAGE}|$$AGENT_REF|g" -e "s|\$${ATEOM_IMAGE}|$(ATEOM_IMAGE)|g" \
+			-e "s|\$${BROKER_ADDRESS}|$(BROKER_ADDRESS)|g" \
+			deploy/openclaw-sidecar.yaml.tmpl | kubectl apply -f -
+	kubectl wait --for=condition=Ready actortemplate/openclaw-sidecar -n ate-demo-ws-poc --timeout=300s
+
+.PHONY: create-openclaw-sidecar
+create-openclaw-sidecar:
+	kubectl ate create atespace demo || true
+	kubectl ate create actor openclaw-sc-1 -a demo --template ate-demo-ws-poc/openclaw-sidecar
 
 .PHONY: deploy
 deploy: deploy-broker

@@ -1,0 +1,3 @@
+# Build inputs staged by the Makefile.
+local-proxy
+proxy-certs/

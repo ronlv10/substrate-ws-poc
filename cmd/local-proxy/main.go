@@ -1,8 +1,15 @@
-// local-proxy runs inside the actor image as PID 1: it impersonates Slack on
-// loopback for the co-resident stock Bolt agent (given as argv after "--"),
-// and relays events and Web API calls to the egress broker. With no
-// --broker-address it runs standalone: Web API stubs plus synthetic event
-// injection, for exercising the agent-facing half on its own.
+// local-proxy impersonates Slack on loopback for a co-resident stock agent and
+// relays events and Web API calls to the egress broker. It runs one of two ways:
+//
+//   - PID 1 supervising the agent, given as argv after "--" (single-container
+//     actor); the proxy binds its listeners before spawning the agent.
+//   - Standalone in its own sidecar container (no argv): it just serves, and the
+//     agent — in a sibling container sharing the sandbox loopback — connects over
+//     127.0.0.1. The agent reaches it because the agent image's /etc/hosts points
+//     slack.com at loopback; readiness is this container's /readyz.
+//
+// With no --broker-address it runs a broker-less standalone loop: Web API stubs
+// plus synthetic event injection, for exercising the agent-facing half on its own.
 package main
 
 import (
@@ -10,6 +17,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -65,8 +74,13 @@ func main() {
 	}
 
 	if len(agentArgv) == 0 {
-		log.Error("local-proxy: no agent command given (pass it after --)")
-		os.Exit(2)
+		// Sidecar mode: the agent runs in a sibling container, so there is nothing
+		// to supervise here — serve until the sandbox is torn down.
+		log.Info("local-proxy: sidecar mode; serving until terminated")
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		os.Exit(0)
 	}
 	os.Exit(proxy.RunAgent(log, agentArgv))
 }
