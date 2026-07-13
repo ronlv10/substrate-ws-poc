@@ -24,34 +24,7 @@ goes idle the broker suspends it again.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Slack(["Slack"])
-
-    subgraph K8s["Kubernetes cluster · agent-substrate"]
-        direction TB
-        CP["Substrate control plane"]
-        Broker["Egress Broker<br/>persistent · always-on"]
-        Actor["Echo Actor<br/>@slack/bolt — echo bot<br/>stock Slack bot · no lifecycle code<br/>suspended between messages"]
-        Broker -- "Resume / Suspend Actor" --> CP
-        Broker <-.->|Socket Mode WS · only while resumed| Actor
-        CP -.->|restore / checkpoint| Actor
-    end
-
-    Slack <==>|Socket Mode WSS · persistent| Broker
-
-    linkStyle 3 stroke:#2ea043,stroke-width:3px
-    linkStyle 1 stroke:#3ec7d4,stroke-width:2px
-
-    classDef slack fill:#0b1e3a,stroke:#3b82f6,color:#e5edff;
-    classDef cp fill:#241833,stroke:#a855f7,color:#f3e8ff;
-    classDef broker fill:#2a1e07,stroke:#d99a1c,color:#fde9b8;
-    classDef actor fill:#0c2417,stroke:#3f8f5f,color:#cfe8d6;
-    class Slack slack
-    class CP cp
-    class Broker broker
-    class Actor actor
-```
+![WS-PoC architecture](docs/architecture.png)
 
 The **broker** holds the persistent Slack Socket Mode connection and drives the
 actor's lifecycle; the **actor** is a stock Slack bot that substrate checkpoints
