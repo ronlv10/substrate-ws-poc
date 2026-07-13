@@ -259,10 +259,12 @@ func TestUnackedEventDefersIdleSuspend(t *testing.T) {
 	waitFor(t, "idle suspend", func() bool { return suspender.suspends() == 1 })
 }
 
-func TestHandlingHoldDefersSuspendUntilReply(t *testing.T) {
-	// Long handling grace, short idle grace: acking receipt must NOT let the
-	// actor suspend while the agent is still producing its reply.
-	s, conn, suspender := newHandlingSession(t, 20*time.Millisecond, time.Second)
+func TestHandlingHoldDefersSuspendAcrossEarlyEgress(t *testing.T) {
+	// Long handling grace, short idle grace. An early egress (e.g. auth.test the
+	// agent makes before it thinks) must NOT release the hold: the reply that
+	// follows produces no egress, so releasing here would suspend the actor mid
+	// model call. The hold runs its full grace regardless.
+	s, conn, suspender := newHandlingSession(t, 20*time.Millisecond, 200*time.Millisecond)
 	sink := &fakeSink{}
 	s.Attach(sink, 0)
 
@@ -270,16 +272,16 @@ func TestHandlingHoldDefersSuspendUntilReply(t *testing.T) {
 	waitFor(t, "delivery", func() bool { return len(sink.delivered()) == 1 })
 	s.Ack(1) // Socket Mode acks on receipt, before the reply
 
-	// Idle grace elapses, but the handling hold keeps the actor alive.
-	time.Sleep(80 * time.Millisecond)
-	if got := suspender.suspends(); got != 0 {
-		t.Fatalf("suspended mid-handle, before the reply: %d", got)
-	}
-
-	// The agent replies (an egress relay); once it completes, idle suspend fires.
+	// An early relay completes, then the agent goes quiet to think.
 	s.beginForward()
 	s.endForward()
-	waitFor(t, "idle suspend after reply", func() bool { return suspender.suspends() == 1 })
+	time.Sleep(80 * time.Millisecond) // past idle grace, within handling grace
+	if got := suspender.suspends(); got != 0 {
+		t.Fatalf("suspended after an early egress, mid-handle: %d", got)
+	}
+
+	// Only once the handling grace elapses does the actor suspend.
+	waitFor(t, "suspend after handling grace", func() bool { return suspender.suspends() == 1 })
 }
 
 func TestHandlingHoldExpiresWhenAgentNeverReplies(t *testing.T) {

@@ -154,8 +154,11 @@ func (s *session) onIdle() {
 func (s *session) beginForward() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// The agent is now replying; the inFlight bracket takes over the hold.
-	s.clearHandlingLocked()
+	// Do NOT clear the handling hold here: the agent's first egress is often an
+	// early Slack call (auth.test, conversations.info) made before it thinks, not
+	// the reply. Releasing on it would let the actor suspend during the model
+	// call that follows — the reply produces no egress to hold on. The hold runs
+	// its full grace instead; inFlight additionally holds across each relay.
 	s.inFlight++
 	if s.idleTmr != nil {
 		s.idleTmr.Stop()
