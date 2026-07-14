@@ -24,6 +24,7 @@ BROKER_NS  = os.environ.get("BROKER_NS", "ws-poc")
 ACTOR_NS   = os.environ.get("ACTOR_NS", "ate-demo-ws-poc")
 ATESPACE   = os.environ.get("ATESPACE", "demo")
 ACTOR      = os.environ.get("ACTOR", "echo-1")
+DEPLOY     = os.environ.get("DEPLOY", "ws-poc-echo-deployment")
 
 STATE = {"broker": {}, "substrate": {}, "actor": {}, "slack": {}, "metrics": {}, "ts": 0}
 # SSE channels: "events" (classified lifecycle events), "broker"/"actor" (raw-ish
@@ -164,7 +165,10 @@ def tail_broker():
 _ACTOR_KEEP = ("echo-actor:", "starting Socket Mode", "Bolt app is running",
                "Now connected to Slack", "connected:ready", "Reconnecting to Slack",
                "apps.connections.open", "Received a message on the WebSocket",
-               "Switched to the secondary", "Actor restored")
+               "Switched to the secondary", "Actor restored",
+               # OpenClaw / proxy markers
+               "agent socket attached", "event delivered to agent",
+               "model-fetch] start", "model-fetch] response", "delivered reply to channel")
 
 
 def tail_actor():
@@ -191,7 +195,7 @@ def tail_actor():
 
     while True:
         for ln in run(["kubectl", "get", "pods", "-n", ACTOR_NS, "-o", "name"]).splitlines():
-            if "ws-poc-echo-deployment" in ln:
+            if DEPLOY in ln:
                 pod = ln.split("/")[-1]
                 if pod not in started:
                     started.add(pod)
@@ -244,7 +248,7 @@ HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>WS-PoC — suspendable Slack agent · live component diagram</h1>
-  <div class="sub">Post a message that @-mentions the bot; watch the request flow animate and the actor wake, echo, and get suspended.</div>
+  <div class="sub">Message the bot; watch the request flow animate and the actor wake, reply, and get suspended.</div>
 </header>
 <div class="wrap">
   <div class="board">
@@ -308,11 +312,11 @@ HTML = r"""<!doctype html>
         <circle id="st-broker" cx="502" cy="236" r="5" fill="#6b7688"/>
         <text x="408" y="284" fill="#e6edf5" font-size="16" font-weight="700" text-anchor="middle">Egress Broker</text>
       </g>
-      <!-- Echo Actor (green, gVisor) -->
+      <!-- Actor (green, gVisor) -->
       <g id="n-actor" class="box">
         <rect x="636" y="202" width="272" height="150" rx="12" fill="#10231a" stroke="#2ea043" stroke-width="1.5"/>
         <circle id="st-actor" cx="894" cy="214" r="5" fill="#6b7688"/>
-        <text x="772" y="228" fill="#e6edf5" font-size="14" font-weight="700" text-anchor="middle">Echo Actor</text>
+        <text x="772" y="228" fill="#e6edf5" font-size="14" font-weight="700" text-anchor="middle">Actor</text>
         <rect x="656" y="248" width="232" height="86" rx="9" fill="#0c1a13" stroke="#1f3b2a"/>
         <text x="772" y="272" fill="#e6edf5" font-size="13" font-weight="600" text-anchor="middle">@slack/bolt ⇄ local proxy</text>
         <text x="772" y="290" fill="#8595ad" font-size="11" text-anchor="middle">stock bot + proxy · loopback WS survives</text>
@@ -340,7 +344,7 @@ HTML = r"""<!doctype html>
       <div class="kv"><span>Slack connection</span><span class="v" id="p-slack">…</span></div>
       <div class="kv"><span>Egress broker</span><span class="v" id="p-broker">…</span></div>
       <div class="kv"><span>Substrate control plane</span><span class="v" id="p-sub">…</span></div>
-      <div class="kv"><span style="font-weight:600">Actor (echo-1)</span><span class="v" id="p-actor" style="font-weight:600">…</span></div>
+      <div class="kv"><span style="font-weight:600">Actor</span><span class="v" id="p-actor" style="font-weight:600">…</span></div>
       <div class="kv"><span>Actor worker (ATEOM pod)</span><span class="v" id="p-pod">…</span></div>
     </div>
     <div class="panel">

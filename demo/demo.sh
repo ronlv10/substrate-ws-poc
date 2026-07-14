@@ -20,6 +20,8 @@ BROKER_NS="${BROKER_NS:-ws-poc}"
 ACTOR_NS="${ACTOR_NS:-ate-demo-ws-poc}"
 ATESPACE="${ATESPACE:-demo}"
 ACTOR="${ACTOR:-echo-1}"
+# Substring matching the actor's worker deployment (its pods carry the agent).
+DEPLOY="${DEPLOY:-ws-poc-echo-deployment}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [ -t 1 ]; then
@@ -38,16 +40,25 @@ hr
 echo "${BOLD}  WS-PoC — evidence: the actor doesn't manage its own lifecycle${RESET}"
 hr
 echo
-echo "${BOLD}  1) The actor is a stock Slack bot — proof from its source${RESET}  ${DIM}(echo-actor/app.js)${RESET}"
-echo
-echo "     modules it imports:"
-grep -nE 'require\(' "$REPO/echo-actor/app.js" | sed -E 's/^/       /'
-lc=$(grep -cE 'child_process|execFile|spawn|SuspendActor|ResumeActor|CheckpointWorkload|ateapi|@grpc|grpc' "$REPO/echo-actor/app.js" 2>/dev/null || echo 0)
-echo
-echo "     lifecycle/exec/gRPC calls in the actor:  ${BOLD}${GRN}${lc} matches${RESET}"
-echo "     ${DIM}→ no child_process, no gRPC, no SuspendActor/ResumeActor. It CANNOT${RESET}"
-echo "     ${DIM}  suspend or resume itself, and has no substrate awareness — the${RESET}"
-echo "     ${DIM}  co-resident local proxy owns identity and lifecycle.${RESET}"
+if [ -f "$REPO/echo-actor/app.js" ] && [ -z "${ACTOR##echo*}" ]; then
+  echo "${BOLD}  1) The actor is a stock Slack bot — proof from its source${RESET}  ${DIM}(echo-actor/app.js)${RESET}"
+  echo
+  echo "     modules it imports:"
+  grep -nE 'require\(' "$REPO/echo-actor/app.js" | sed -E 's/^/       /'
+  lc=$(grep -cE 'child_process|execFile|spawn|SuspendActor|ResumeActor|CheckpointWorkload|ateapi|@grpc|grpc' "$REPO/echo-actor/app.js" 2>/dev/null || echo 0)
+  echo
+  echo "     lifecycle/exec/gRPC calls in the actor:  ${BOLD}${GRN}${lc} matches${RESET}"
+  echo "     ${DIM}→ no child_process, no gRPC, no SuspendActor/ResumeActor. It CANNOT${RESET}"
+  echo "     ${DIM}  suspend or resume itself, and has no substrate awareness — the${RESET}"
+  echo "     ${DIM}  proxy owns identity and lifecycle.${RESET}"
+else
+  echo "${BOLD}  1) The agent runs unmodified — a stock upstream image${RESET}"
+  echo
+  echo "     ${DIM}This actor (e.g. OpenClaw) is a third-party agent run from its stock${RESET}"
+  echo "     ${DIM}image; it has no substrate awareness and cannot suspend or resume${RESET}"
+  echo "     ${DIM}itself. The proxy (baked in, or a sidecar container) owns identity${RESET}"
+  echo "     ${DIM}and lifecycle; the always-on broker checkpoints and wakes the actor.${RESET}"
+fi
 echo
 echo "${BOLD}  2) The lifecycle lives in the broker — proof from its source${RESET}  ${DIM}(internal/broker)${RESET}"
 sus=$(grep -rhoE 'SuspendActor' "$REPO/internal/broker/" 2>/dev/null | wc -l | tr -d ' ')
@@ -92,23 +103,26 @@ for raw in sys.stdin:
             print()
             emit("[BROKER]", CYN, t, "Slack sent a message on the persistent connection", CYN)
         elif "resuming suspended actor" in m:
-            emit("[BROKER]", CYN, t, "→ calls ResumeActor(demo/echo-1) on the substrate control plane", BOLD+CYN)
+            emit("[BROKER]", CYN, t, "→ calls ResumeActor on the substrate control plane", BOLD+CYN)
         elif "proxy announced" in m:
             emit("[BROKER]", CYN, t, "the resumed actor's proxy reconnects and re-announces")
         elif "proxy acked event" in m:
             emit("[BROKER]", CYN, t, "the actor handled the event (proxy acked)")
         elif "idle; suspending from broker" in m:
-            emit("[BROKER]", CYN, t, "→ calls SuspendActor(demo/echo-1) — checkpoints it from OUTSIDE", BOLD+CYN)
-    else:  # actor
-        # actor logs are the proxy, the echo-actor's stderr, and Bolt's socket-mode logs
+            emit("[BROKER]", CYN, t, "→ calls SuspendActor — checkpoints it from OUTSIDE", BOLD+CYN)
+    else:  # actor: the proxy, plus the agent's own stdout (Bolt, or OpenClaw)
         if "event delivered to agent" in m:
             emit("[ACTOR]", GRN, t, "proxy delivers the buffered event to the agent over loopback")
         elif "Bolt app is running" in m:
             emit("[ACTOR]", GRN, t, "Bolt app running")
+        elif "agent socket attached" in m:
+            emit("[ACTOR]", GRN, t, "agent (re)connects to the proxy over loopback")
         elif "handling app_mention" in m or "handling message" in m:
             emit("[ACTOR]", GRN, t, "handles the @-mention and composes a reply", BOLD+GRN)
-        elif "reply posted" in m:
-            emit("[ACTOR]", GRN, t, "posts echo via chat.postMessage", BOLD+GRN)
+        elif "model-fetch] start" in m:
+            emit("[ACTOR]", GRN, t, "calls the model to compose a reply", BOLD+GRN)
+        elif "reply posted" in m or "delivered reply to channel" in m:
+            emit("[ACTOR]", GRN, t, "posts the reply via chat.postMessage", BOLD+GRN)
 PYEOF
 
 # --- watch the actor's status so the SUSPENDED state itself is visible -----
@@ -141,7 +155,7 @@ status_watch &
 pids+=($!)
 kubectl logs -n "$BROKER_NS" deploy/egress-broker -f --tail=0 2>/dev/null | python3 -u "$FMT" broker &
 pids+=($!)
-for pod in $(kubectl get pods -n "$ACTOR_NS" -o name 2>/dev/null | grep ws-poc-echo-deployment); do
+for pod in $(kubectl get pods -n "$ACTOR_NS" -o name 2>/dev/null | grep "$DEPLOY"); do
   kubectl logs -n "$ACTOR_NS" "$pod" -f --tail=0 --all-containers 2>/dev/null | python3 -u "$FMT" actor &
   pids+=($!)
 done
