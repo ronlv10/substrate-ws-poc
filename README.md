@@ -82,13 +82,5 @@ make create-openclaw-sidecar
 
 Needs a Socket Mode Slack app: app token (`xapp-…`, `connections:write`), bot
 token (`xoxb-…`, `chat:write`), `message.im` + `app_mention` subscriptions. One
-app serves one actor (shared tokens split events — see backlog). Omit
-`BROKER_ADDRESS` to run the proxy standalone (stubs + synthetic events, no broker).
-
-## Backlog
-
-- **Multi-tenant Socket Mode** — per-app session keying so actors can share an app.
-- **Durable buffer / HA** — buffer and captured tokens are in-memory; a broker
-  restart loses them (and resets the event sequence).
-- **Transport auth** — gRPC is plaintext; identity of record is the `Announce`.
-  Production would add mTLS or a per-actor token.
+app serves one actor (shared tokens split events). Omit `BROKER_ADDRESS` to run
+the proxy standalone (stubs + synthetic events, no broker).
